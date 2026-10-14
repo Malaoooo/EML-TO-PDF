@@ -37,7 +37,7 @@ import extract_msg
 from bs4 import UnicodeDammit
 from pypdf import PdfWriter
 
-VERSION = '1.2.0'
+VERSION = '1.3.0'
 EXTS = {'.msg', '.eml'}
 APP_DIR = Path(os.environ.get('APPDATA', '.'), 'Email to PDF')
 DEFAULT_OUT = Path.home() / 'Documents' / 'Email PDFs'   # for emails dragged out of Outlook (they have no folder)
@@ -311,11 +311,13 @@ def pdf_target(src, mail, settings, taken, fallback_dir=None):
     return pdf
 
 
-def convert(path, settings=None, printer=None, taken=None, fallback_dir=None):
-    """Returns (pdf path, 'exact' or 'close', attachments added, attachments skipped)."""
+def convert(path, settings=None, printer=None, taken=None, fallback_dir=None, skip_existing=False):
+    """Returns (pdf path, 'exact' / 'close' / 'skipped', attachments added, attachments skipped)."""
     path, settings = Path(path), settings or DEFAULTS
     mail = load(path)
     pdf = pdf_target(path, mail, settings, set() if taken is None else taken, fallback_dir)
+    if skip_existing and pdf.exists():
+        return pdf, 'skipped', 0, 0
     pdf.parent.mkdir(parents=True, exist_ok=True)
     mode = 'close'
     if printer and path.suffix.lower() == '.msg':   # Outlook can't open .eml files this way
@@ -356,44 +358,94 @@ def export_outlook_selection(folder):
     return out
 
 
+MAIL_CLASSES = {43, 53, 54, 55, 56, 57}   # olMail and meeting request/cancel/response items
+
+
+def collect_outlook_folder(folder, subfolders, start, end, rel=Path()):
+    """(entry id, store id, file stem, relative output folder) for each email in an Outlook folder."""
+    # ponytail: walks every item over COM (~1 ms each); use Items.Restrict on dates if 50k+ folders get slow
+    rel = rel / safe_name(folder.Name, 80)
+    out, items = [], folder.Items
+    for i in range(1, items.Count + 1):
+        it = items.Item(i)
+        if getattr(it, 'Class', 0) not in MAIL_CLASSES:
+            continue
+        rt = it.ReceivedTime
+        day = datetime.date(rt.year, rt.month, rt.day)
+        if (start and day < start) or (end and day > end):
+            continue
+        out.append((it.EntryID, folder.StoreID, f'{rt:%Y-%m-%d %H%M} - {safe_name(it.Subject, 100)}', rel))
+    if subfolders:
+        for j in range(1, folder.Folders.Count + 1):
+            out += collect_outlook_folder(folder.Folders.Item(j), True, start, end, rel)
+    return out
+
+
 def run_batch(job, settings, ready, events, cancel):
-    """Worker thread: converts the job and reports progress to the window through `events`."""
+    """Worker thread: converts the job and reports progress to the window through `events`.
+
+    job: list of paths, 'outlook' (emails just dragged from Outlook), or a dict for a whole Outlook folder.
+    """
     import pythoncom
     pythoncom.CoInitialize()
     temp = printer = None
-    ok = 0
-    files = []
+    ok = done_before = 0
+    tasks = []   # (row label, open() -> (.msg/.eml path, output folder or None, original path or None))
+    skip_existing = False
     try:
-        fallback, empty = None, 'No .msg or .eml files found there.'
+        empty = 'No .msg or .eml files found there.'
         if job == 'outlook':
             events.put(('status', 'Getting the emails from Outlook...'))
             temp = tempfile.mkdtemp(prefix='email-to-pdf-')
             empty = 'Nothing to convert: select emails in classic Outlook, then drag them here.'
             try:
-                files = export_outlook_selection(temp)
+                tasks = [(f.name, lambda f=f: (f, DEFAULT_OUT, None)) for f in export_outlook_selection(temp)]
             except Exception as e:
                 empty = f'Could not get the emails from Outlook: {e}'
-            fallback = DEFAULT_OUT
+        elif isinstance(job, dict):   # a whole Outlook folder
+            events.put(('status', 'Reading the Outlook folder...'))
+            temp = tempfile.mkdtemp(prefix='email-to-pdf-')
+            skip_existing = job['skip']
+            empty = 'No emails in that folder (or date range).'
+            try:
+                ns = outlook()[0].Session
+                found = collect_outlook_folder(ns.GetFolderFromID(job['entry'], job['store']), job['sub'], job['from'], job['to'])
+            except Exception as e:
+                found, empty = [], f'Could not read the Outlook folder: {e}'
+            base = Path(settings['out_dir'] or DEFAULT_OUT)
+
+            def save(eid, sid, stem, rel):
+                p = Path(temp, stem + '.msg')
+                ns.GetItemFromID(eid, sid).SaveAs(str(p), 9)   # olMSGUnicode
+                return p, base / rel, None
+
+            tasks = [(f'{t[3].as_posix()}  ›  {t[2]}', lambda t=t: save(*t)) for t in found]
+            settings = {**settings, 'out_dir': ''}   # each email goes to its mirrored folder under `base`
         else:
-            files = list(expand(job))
-        if not files:
+            tasks = [(f.name, lambda f=f: (f, None, str(f))) for f in expand(job)]
+        if not tasks:
             events.put(('status', empty))
             return
-        events.put(('queue', [f.name for f in files]))
-        if ready and any(f.suffix.lower() == '.msg' for f in files):
+        events.put(('queue', [label for label, _ in tasks]))
+        if ready and (not isinstance(job, list) or any(Path(p).suffix.lower() == '.msg' for p in expand(job))):
             events.put(('status', 'Starting Outlook and Word...'))
             try:
                 printer = OutlookPrinter()
             except Exception:
                 pass   # every file then falls back to close match, which the Result column shows
         taken = set()
-        for i, f in enumerate(files):
+        for i, (label, open_task) in enumerate(tasks):
             if cancel.is_set():
                 break
-            events.put(('working', i, f'Converting {i + 1} of {len(files)}: {f.name}'))
-            src = None if temp else str(f)   # emails dragged from Outlook only existed temporarily
+            events.put(('working', i, f'Converting {i + 1} of {len(tasks)}: {label}'))
+            src = path = None
             try:
-                pdf, mode, added, skipped = convert(f, settings, printer, taken, fallback)
+                path, out_dir, src = open_task()
+                pdf, mode, added, skipped = convert(path, settings, printer, taken, out_dir, skip_existing)
+                if mode == 'skipped':
+                    events.put(('row', i, '–  Already converted', 'skipped', str(pdf), src))
+                    done_before += 1
+                    continue
                 note = 'Exact copy' if mode == 'exact' else 'Close match'
                 if added:
                     note += f' + {added} attachment{"s" * (added > 1)}'
@@ -402,15 +454,26 @@ def run_batch(job, settings, ready, events, cancel):
                 events.put(('row', i, '✔  ' + note, mode, str(pdf), src))
                 ok += 1
             except Exception as e:
-                events.put(('row', i, '✖  Failed (double-click for why)', 'failed', f'{f}\n\n{e}', src))
+                events.put(('row', i, '✖  Failed (double-click for why)', 'failed', f'{label}\n\n{e}', src))
+            finally:
+                if path and isinstance(job, dict):   # folder exports can be huge: don't keep the temp copies
+                    path.unlink(missing_ok=True)
     finally:
         if printer:
             printer.close()
         if temp:
             shutil.rmtree(temp, ignore_errors=True)
-        if files:
+        if isinstance(job, dict) and job.get('quit_outlook'):
+            try:
+                ol = outlook()[0]
+                if ol.Explorers.Count == 0:
+                    ol.Quit()
+            except Exception:
+                pass
+        if tasks:
             word = 'Cancelled' if cancel.is_set() else 'Done'
-            events.put(('status', f'{word}: {ok} of {len(files)} converted. Double-click a row to open its PDF.'))
+            extra = f', {done_before} already done' if done_before else ''
+            events.put(('status', f'{word}: {ok} of {len(tasks)} converted{extra}. Double-click a row to open its PDF.'))
         events.put(('done',))
         pythoncom.CoUninitialize()
 
@@ -501,6 +564,7 @@ def main():
     zone_state = {'hot': False}
     pick = ttk.Button(zone, text='Choose emails', style='Accent.TButton')
     folder = ttk.Button(zone, text='Choose folder')
+    from_ol = ttk.Button(zone, text='From Outlook folder')
 
     def draw_zone(_=None):
         zone.delete('all')
@@ -535,8 +599,10 @@ def main():
                          fill=pal['accent'] if hot else pal['fg'], font=(font, 16, 'bold'))
         zone.create_text(cx, cy + 16, fill=pal['muted'], font=(font, 10),
                          text='.msg or .eml files, folders, or emails straight from classic Outlook')
-        zone.create_window(cx - 8, cy + 62, window=pick, anchor='e')
-        zone.create_window(cx + 8, cy + 62, window=folder, anchor='w')
+        half = folder.winfo_reqwidth() / 2 + 8   # three buttons, centred on the middle one
+        zone.create_window(cx - half, cy + 62, window=pick, anchor='e')
+        zone.create_window(cx, cy + 62, window=folder)
+        zone.create_window(cx + half, cy + 62, window=from_ol, anchor='w')
 
     def set_hot(hot):
         if zone_state['hot'] != hot:
@@ -545,7 +611,7 @@ def main():
 
     zone.bind('<Configure>', draw_zone)
     zone.bind('<Enter>', lambda e: set_hot(True))
-    zone.bind('<Leave>', lambda e: set_hot(False) if not zone.winfo_containing(e.x_root, e.y_root) in (pick, folder) else None)
+    zone.bind('<Leave>', lambda e: set_hot(False) if not zone.winfo_containing(e.x_root, e.y_root) in (pick, folder, from_ol) else None)
 
     # --- results view ---
     results = ttk.Frame(content)
@@ -553,6 +619,8 @@ def main():
     bar.pack(fill='x')
     add_more = ttk.Button(bar, text='Add emails', style='Accent.TButton')
     add_more.pack(side='left')
+    add_ol = ttk.Button(bar, text='From Outlook folder')
+    add_ol.pack(side='left', padx=(8, 0))
     cancel_btn = ttk.Button(bar, text='Cancel')
     clear_btn = ttk.Button(bar, text='Clear')
     clear_btn.pack(side='right')
@@ -604,7 +672,8 @@ def main():
         style.configure('Muted.TLabel', foreground=pal['muted'])
         style.configure('CardTitle.TLabel', font=(font, 11, 'bold'))
         style.configure('Treeview', rowheight=34)
-        for tag in ('exact', 'close', 'failed'):
+        pal['skipped'] = pal['muted']
+        for tag in ('exact', 'close', 'failed', 'skipped'):
             tree.tag_configure(tag, foreground=pal[tag])
             for k in range(6):   # fade-in steps from muted to the final color
                 tree.tag_configure(f'{tag}{k}', foreground=mix(pal['muted'], pal[tag], k / 6))
@@ -626,7 +695,7 @@ def main():
     # --- running a batch ---
     def set_busy(busy):
         state['busy'] = busy
-        for w in (pick, folder, add_more, setup_btn, clear_btn):
+        for w in (pick, folder, from_ol, add_more, add_ol, setup_btn, clear_btn):
             w.configure(state='disabled' if busy else 'normal')
         if busy:
             cancel_btn.configure(state='normal', text='Cancel')
@@ -901,6 +970,87 @@ def main():
         check()
         win.grab_set()
 
+    def outlook_folder_dialog():
+        if state['busy']:
+            return
+        if not refresh():
+            messagebox.showinfo('Email to PDF', 'Converting an Outlook folder needs classic Outlook signed in on this PC.\n\n'
+                                'Click "Set up" to see what is missing.', parent=root)
+            return
+        try:
+            ol, started = outlook()
+            picked = ol.Session.PickFolder()   # Outlook's own folder picker
+        except Exception as e:
+            messagebox.showerror('Email to PDF', f'Could not open Outlook: {e}', parent=root)
+            return
+
+        def quit_ol():   # only an Outlook we started just for this, with no window open
+            try:
+                if started and ol.Explorers.Count == 0:
+                    ol.Quit()
+            except Exception:
+                pass
+
+        if picked is None:
+            return quit_ol()
+        base = Path(settings['out_dir'] or DEFAULT_OUT)
+        win = tk.Toplevel(root)
+        win.title('Convert an Outlook folder')
+        win.transient(root)
+        win.resizable(False, False)
+        style_titlebar(win, sv_ttk.get_theme() == 'dark')
+        body = ttk.Frame(win, padding=24)
+        body.pack(fill='both', expand=True)
+        ttk.Label(body, text='Convert an Outlook folder', font=(font, 15, 'bold')).pack(anchor='w')
+        box = ttk.Frame(body, style='Card.TFrame', padding=(16, 12))
+        box.pack(fill='x', pady=(12, 0))
+        ttk.Label(box, text=picked.Name, style='CardTitle.TLabel').pack(anchor='w')
+        ttk.Label(box, style='Muted.TLabel', text=f'{picked.FolderPath.lstrip(chr(92))}  •  {picked.Items.Count} items').pack(anchor='w')
+        sub_var, skip_var = tk.BooleanVar(value=False), tk.BooleanVar(value=True)
+        has_subs = picked.Folders.Count > 0
+        ttk.Checkbutton(body, text=f'Include subfolders ({picked.Folders.Count})' if has_subs else 'Include subfolders (none)',
+                        variable=sub_var, state='normal' if has_subs else 'disabled').pack(anchor='w', pady=(14, 0))
+        dates = ttk.Frame(body)
+        dates.pack(anchor='w', pady=(12, 0))
+        ttk.Label(dates, text='Received from').pack(side='left')
+        d_from = ttk.Entry(dates, width=12)
+        d_from.pack(side='left', padx=8)
+        ttk.Label(dates, text='to').pack(side='left')
+        d_to = ttk.Entry(dates, width=12)
+        d_to.pack(side='left', padx=8)
+        ttk.Label(body, style='Muted.TLabel', text='Dates like 2026-10-14. Leave empty for all emails.').pack(anchor='w', pady=(4, 0))
+        ttk.Checkbutton(body, text='Skip emails that already have a PDF (handy for re-running later)',
+                        variable=skip_var).pack(anchor='w', pady=(12, 0))
+        ttk.Label(body, style='Muted.TLabel', wraplength=460, justify='left',
+                  text=f'PDFs go to {base / safe_name(picked.Name, 80)}, with subfolders matching Outlook.').pack(anchor='w', pady=(12, 0))
+        err = ttk.Label(body, foreground=pal['failed'])
+        err.pack(anchor='w', pady=(6, 0))
+
+        def go():
+            try:
+                parse = lambda e: datetime.date.fromisoformat(e.get().strip()) if e.get().strip() else None
+                first, last = parse(d_from), parse(d_to)
+            except ValueError:
+                return err.configure(text='Dates must look like 2026-10-14.')
+            if first and last and first > last:
+                return err.configure(text='The "from" date is after the "to" date.')
+            job = dict(entry=picked.EntryID, store=picked.StoreID, sub=sub_var.get(), skip=skip_var.get(),
+                       quit_outlook=started, **{'from': first, 'to': last})
+            win.destroy()
+            start(job)
+
+        def cancel_dialog():
+            win.destroy()
+            quit_ol()
+
+        btns = ttk.Frame(body)
+        btns.pack(fill='x', pady=(10, 0))
+        ttk.Button(btns, text='Convert', style='Accent.TButton', command=go).pack(side='right')
+        ttk.Button(btns, text='Cancel', command=cancel_dialog).pack(side='right', padx=8)
+        win.protocol('WM_DELETE_WINDOW', cancel_dialog)
+        win.bind('<Return>', lambda e: go())
+        win.grab_set()
+
     def choose_emails():
         start(list(filedialog.askopenfilenames(parent=root, filetypes=[('Outlook emails', '*.msg *.eml'), ('All files', '*.*')])))
 
@@ -908,6 +1058,8 @@ def main():
     gear.configure(command=toggle_panel)
     pick.configure(command=choose_emails)
     add_more.configure(command=choose_emails)
+    from_ol.configure(command=outlook_folder_dialog)
+    add_ol.configure(command=outlook_folder_dialog)
     folder.configure(command=lambda: start([d] if (d := filedialog.askdirectory(parent=root)) else []))
     open_dir.configure(command=lambda: last_dir and os.startfile(last_dir[0]))
     cancel_btn.configure(command=on_cancel)
