@@ -10,7 +10,8 @@ from pathlib import Path
 
 from pypdf import PdfReader, PdfWriter
 
-from email_to_pdf import EdgePrinter, build_html, convert, expand, load_eml, parse_date, range_dates, setup_status
+from email_to_pdf import (EdgePrinter, build_html, convert, dropped_paths, expand, load_eml, parse_date, range_dates,
+                          save_virtual_files, setup_status)
 
 
 def png(w, h, rgb):
@@ -81,6 +82,65 @@ with tempfile.TemporaryDirectory() as tmp:
     skipped = {}
     assert [p.name for p in expand([scan], skipped)] == ['outlook.msg', 'real.eml'], 'scan picked up non-emails'
     assert skipped['n'] == 2, skipped   # ar_jo.msg and notes.eml were looked at and rejected
+
+    # drag and drop: the shapes File Explorer and Outlook hand over during a drop
+    import pythoncom
+    import win32clipboard
+    from win32com.server.exception import COMException
+    from win32com.server.util import wrap
+
+    def descriptor(names):
+        out = struct.pack('<I', len(names))
+        for n in names:
+            out += b'\0' * 72 + n.encode('utf-16-le').ljust(520, b'\0')
+        return out
+
+    class FakeDrag:   # a minimal IDataObject, like Outlook's
+        _public_methods_ = ['GetData', 'QueryGetData', 'EnumFormatEtc']
+        _com_interfaces_ = [pythoncom.IID_IDataObject]
+
+        def __init__(self, hdrop=None, names=(), contents=()):
+            self.hdrop, self.names, self.contents = hdrop, names, contents
+
+        def GetData(self, fmt):
+            cf, _, _, index, _ = fmt
+            m = pythoncom.STGMEDIUM()
+            if cf == 15 and self.hdrop:
+                m.set(pythoncom.TYMED_HGLOBAL, self.hdrop)
+            elif cf == win32clipboard.RegisterClipboardFormat('FileGroupDescriptorW') and self.names:
+                m.set(pythoncom.TYMED_HGLOBAL, descriptor(self.names))
+            elif cf == win32clipboard.RegisterClipboardFormat('FileContents') and 0 <= index < len(self.contents):
+                kind, value = self.contents[index]
+                m.set(kind, value)
+            else:
+                raise COMException(hresult=-2147221404)   # DV_E_FORMATETC: not offered
+            return m
+
+        def QueryGetData(self, fmt):
+            return 0
+
+        def EnumFormatEtc(self, direction):
+            raise COMException(hresult=-2147467263)   # E_NOTIMPL
+
+    as_data = lambda obj: wrap(obj, pythoncom.IID_IDataObject, useDispatcher=0)
+    files = ['C:\\a b\\one.msg', 'C:\\two.eml']
+    hdrop = struct.pack('<IiiII', 20, 0, 0, 0, 1) + ('\0'.join(files) + '\0\0').encode('utf-16-le')
+    assert dropped_paths(as_data(FakeDrag(hdrop=hdrop))) == files, 'Explorer drop not read'
+    assert dropped_paths(as_data(FakeDrag())) == []
+
+    stream = pythoncom.CreateStreamOnHGlobal()
+    stream.Write(bytes(msg))
+    stream.Seek(0, 0)
+    storage = pythoncom.StgCreateDocfile(None, 0x4001012, 0)   # temporary OLE storage, like a classic Outlook .msg
+    storage.CreateStream('__substg1.0_0037001F', 0x1012, 0, 0).Write('Subject'.encode('utf-16-le'))
+    drop_dir = Path(tmp, 'drop')
+    drop_dir.mkdir()
+    saved = save_virtual_files(as_data(FakeDrag(names=['Re: Q3 / numbers.msg', 'Newsletter.eml'], contents=[
+        (pythoncom.TYMED_ISTORAGE, storage), (pythoncom.TYMED_ISTREAM, stream)])), drop_dir)
+    assert [p.name for p in saved] == ['Re_ Q3 _ numbers.msg', 'Newsletter.eml'], saved
+    assert saved[0].read_bytes()[:8] == b'\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1', 'Outlook storage not saved as .msg'
+    assert saved[1].read_bytes() == bytes(msg), 'stream not saved intact'
+    assert [p.name for p in expand(saved)] == ['Re_ Q3 _ numbers.msg', 'Newsletter.eml'], 'dropped emails not accepted'
 
     # one shared Edge for a batch gives the same PDFs as a fresh Edge per email
     edge = EdgePrinter()

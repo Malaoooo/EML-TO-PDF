@@ -8,7 +8,7 @@ Turns Outlook emails (`.msg` and `.eml`) into PDFs that look like they do in Out
 
 ## Using it
 
-- Drag emails or folders into the window, including straight out of classic Outlook, or click the drop zone, **Choose emails** / **Choose a folder** (Ctrl+O also works), or drop them onto the app icon.
+- Drag emails or folders into the window, including straight out of Outlook (classic or new), or click the drop zone, **Choose emails** / **Choose a folder** (Ctrl+O also works), or drop them onto the app icon.
 - **Export from Outlook** (needs classic Outlook signed in): pick any Outlook folder, optionally with its subfolders and a date range (All, Last 7/30 days, Last 12 months, This year, or custom dates in your usual format). PDFs go to `Documents\Email PDFs\<folder>` (or your Save-to folder) with subfolders matching Outlook. Emails that already have a PDF are skipped, so re-running only converts new mail.
 - In **Settings** (top right): **Save PDFs to**: next to each email (default) or a folder you pick. Emails dragged from Outlook go to `Documents\Email PDFs` unless you pick a folder.
 - **File names**: same as the email file, *Date - Subject*, or *Subject*.

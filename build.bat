@@ -3,9 +3,9 @@ rem Builds dist\Email to PDF.exe (the single file you share), an unpacked copy i
 rem used by the installer) and, if Inno Setup is installed, dist\Email-to-PDF-Setup.exe. Needs Python 3.10+.
 cd /d "%~dp0"
 if not exist .venv python -m venv .venv || exit /b 1
-.venv\Scripts\python -m pip install --quiet --disable-pip-version-check extract-msg pywin32 sv-ttk tkinterdnd2 pypdf pyinstaller || exit /b 1
+.venv\Scripts\python -m pip install --quiet --disable-pip-version-check extract-msg pywin32 sv-ttk pypdf pyinstaller || exit /b 1
 .venv\Scripts\python test_email_to_pdf.py || exit /b 1
-set PYI=.venv\Scripts\python -m PyInstaller --noconfirm --windowed --icon icon.ico --splash splash.png --add-data "icon.ico;." --add-data "icon.png;." --add-data "icons;icons" --collect-data sv_ttk --collect-all tkinterdnd2
+set PYI=.venv\Scripts\python -m PyInstaller --noconfirm --windowed --icon icon.ico --splash splash.png --add-data "icon.ico;." --add-data "icon.png;." --add-data "icons;icons" --collect-data sv_ttk
 %PYI% --onefile --workpath build\onefile --name "Email to PDF" email_to_pdf.py || exit /b 1
 %PYI% --onedir --workpath build\onedir --distpath dist\app --name "Email to PDF" email_to_pdf.py || exit /b 1
 echo.

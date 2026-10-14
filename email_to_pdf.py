@@ -28,6 +28,7 @@ import subprocess
 import sys
 import tempfile
 import socket
+import struct
 import threading
 import time
 import tkinter as tk
@@ -41,7 +42,7 @@ import extract_msg
 from bs4 import UnicodeDammit
 from pypdf import PdfWriter
 
-VERSION = '1.5.0'
+VERSION = '1.5.1'
 EXTS = {'.msg', '.eml'}
 APP_DIR = Path(os.environ.get('APPDATA', '.'), 'Email to PDF')
 DEFAULT_OUT = Path.home() / 'Documents' / 'Email PDFs'   # for emails dragged out of Outlook (they have no folder)
@@ -539,6 +540,82 @@ def expand(paths, skipped=None, cancel=None, on_folder=None):
             yield p
 
 
+DROPEFFECT_COPY = 1   # always copy, never move, so Outlook keeps its emails
+
+
+def dropped_paths(data):
+    """Files dropped from File Explorer (CF_HDROP)."""
+    import pythoncom
+    try:
+        raw = data.GetData((15, None, pythoncom.DVASPECT_CONTENT, -1, pythoncom.TYMED_HGLOBAL)).data   # 15 = CF_HDROP
+    except pythoncom.com_error:
+        return []
+    start, wide = struct.unpack_from('<I', raw)[0], struct.unpack_from('<I', raw, 16)[0]   # DROPFILES header
+    text = raw[start:].decode('utf-16-le' if wide else 'mbcs', 'ignore')
+    return [p for p in text.split('\0') if p]
+
+
+def save_virtual_files(data, folder):
+    """Emails dragged straight out of Outlook (classic or new) arrive as 'virtual files': a list of names
+    (FileGroupDescriptorW) plus each file's content (FileContents). Saves them into folder; returns the paths."""
+    import pythoncom
+    import win32clipboard
+    fmt = win32clipboard.RegisterClipboardFormat
+    raw = data.GetData((fmt('FileGroupDescriptorW'), None, pythoncom.DVASPECT_CONTENT, -1, pythoncom.TYMED_HGLOBAL)).data
+    out = []
+    for i in range(struct.unpack_from('<I', raw)[0]):
+        name = raw[4 + i * 592 + 72:4 + i * 592 + 592].decode('utf-16-le', 'ignore').split('\0')[0]   # FILEDESCRIPTORW.cFileName
+        base, suffix = os.path.splitext(name)   # the name is a subject, not a path: keep any "/" in it
+        if suffix.lower() not in EXTS:
+            base, suffix = name, '.msg'
+        stem, suffix = safe_name(base, 100), suffix.lower()
+        p, n = Path(folder, stem + suffix), 2
+        while p.exists():
+            p, n = Path(folder, f'{stem} ({n}){suffix}'), n + 1
+        medium = data.GetData((fmt('FileContents'), None, pythoncom.DVASPECT_CONTENT, i,
+                               pythoncom.TYMED_ISTORAGE | pythoncom.TYMED_ISTREAM | pythoncom.TYMED_HGLOBAL))
+        if medium.tymed == pythoncom.TYMED_ISTORAGE:   # classic Outlook hands over the .msg as a storage
+            dest = pythoncom.StgCreateDocfile(str(p), 0x1012, 0)   # STGM_CREATE | STGM_READWRITE | STGM_SHARE_EXCLUSIVE
+            medium.data.CopyTo(None, None, dest)
+            dest.Commit(0)
+            del dest
+        elif medium.tymed == pythoncom.TYMED_ISTREAM:
+            with open(p, 'wb') as f:
+                while chunk := medium.data.Read(1 << 20):
+                    f.write(chunk)
+        else:
+            p.write_bytes(medium.data)
+        out.append(p)
+    return out
+
+
+def make_drop_target(on_enter, on_leave, on_drop):
+    """A Windows drop target (IDropTarget) for the main window."""
+    import pythoncom
+    from win32com.server.util import wrap
+
+    class DropTarget:
+        _public_methods_ = ['DragEnter', 'DragOver', 'DragLeave', 'Drop']
+        _com_interfaces_ = [pythoncom.IID_IDropTarget]
+
+        def DragEnter(self, data, key_state, point, effect):
+            on_enter()
+            return DROPEFFECT_COPY
+
+        def DragOver(self, key_state, point, effect):
+            return DROPEFFECT_COPY
+
+        def DragLeave(self):
+            on_leave()
+
+        def Drop(self, data, key_state, point, effect):
+            on_leave()
+            on_drop(data)   # the data is only readable now, while the drop is happening
+            return DROPEFFECT_COPY
+
+    return wrap(DropTarget(), pythoncom.IID_IDropTarget, useDispatcher=0)
+
+
 def export_outlook_selection(folder):
     """Saves the emails selected in classic Outlook (what was just dragged) as .msg files into folder."""
     ol, _ = outlook()
@@ -662,6 +739,10 @@ def run_batch(job, settings, ready, events, cancel):
                 tasks = [(f.name, lambda f=f: (f, DEFAULT_OUT, None)) for f in export_outlook_selection(temp)]
             except Exception as e:
                 empty = f"Couldn't get the emails from Outlook. {friendly_error(e)}"
+        elif isinstance(job, tuple):   # emails dragged out of Outlook, already saved into a temp folder
+            _, temp, dropped = job
+            empty = "What was dropped didn't contain any Outlook emails."
+            tasks = [(f.name, lambda f=f: (f, DEFAULT_OUT, None)) for f in expand(dropped, not_email)]
         elif isinstance(job, dict):   # a whole Outlook folder
             events.put(('status', 'Reading the Outlook folder\u2026'))
             temp = tempfile.mkdtemp(prefix='email-to-pdf-')
@@ -813,11 +894,10 @@ def main():
         pass
     import sv_ttk
     from tkinter import ttk
-    from tkinterdnd2 import COPY, DND_ALL, TkinterDnD
 
     settings = load_settings()
     here = Path(getattr(sys, '_MEIPASS', Path(__file__).parent))
-    root = TkinterDnD.Tk()
+    root = tk.Tk()
     root.title('Email to PDF')
     root.geometry('980x720')
     root.minsize(760, 580)
@@ -1082,7 +1162,7 @@ def main():
         if where:
             open_dir.configure(state='normal', style='Accent.TButton')
             add_more.configure(style='TButton')
-        retriable = failed and state['job'] != 'outlook'   # dragged Outlook emails only existed temporarily
+        retriable = failed and isinstance(state['job'], (list, dict))   # dragged Outlook emails only existed temporarily
         if retriable:
             retry_btn.pack(side='right', before=open_dir)
             retry_btn.configure(state='normal')
@@ -1240,23 +1320,28 @@ def main():
     tree.bind('<Motion>', on_motion)
     tree.bind('<Leave>', hide_tip)
 
-    # --- drag and drop: files/folders from Explorer, or emails straight out of classic Outlook ---
-    def on_drop(event):
-        set_zone('idle')
-        paths = [p for p in root.tk.splitlist(event.data) if os.path.exists(p)] if event.data else []
-        # Outlook drags carry no files; the dragged emails are Outlook's current selection
-        root.after(50, start, paths or 'outlook')
-        return COPY   # never MOVE, so Outlook keeps its emails
+    # --- drag and drop: files/folders from Explorer, or emails straight out of Outlook (classic or new) ---
+    def on_drop(data):
+        if state['busy']:
+            return
+        paths = dropped_paths(data)
+        if paths:
+            return root.after(50, start, paths)
+        temp = tempfile.mkdtemp(prefix='email-to-pdf-drop-')
+        try:   # Outlook hands over the dragged emails themselves; read them now, during the drop
+            saved = save_virtual_files(data, temp)
+        except Exception:
+            saved = []
+        if saved:
+            root.after(50, start, ('dropped', temp, [str(p) for p in saved]))
+        else:   # last resort: ask classic Outlook what is selected (that is what was dragged)
+            shutil.rmtree(temp, ignore_errors=True)
+            root.after(50, start, 'outlook')
 
-    def on_drop_enter(_):
-        set_zone('drag')
-        return COPY
-
-    root.drop_target_register(DND_ALL)
-    root.dnd_bind('<<DropEnter>>', on_drop_enter)
-    root.dnd_bind('<<DropPosition>>', lambda e: COPY)
-    root.dnd_bind('<<DropLeave>>', lambda e: set_zone('idle'))
-    root.dnd_bind('<<Drop>>', on_drop)
+    import pythoncom
+    pythoncom.OleInitialize()
+    drop_hwnd = int(root.wm_frame(), 16)
+    pythoncom.RegisterDragDrop(drop_hwnd, make_drop_target(lambda: set_zone('drag'), lambda: set_zone('idle'), on_drop))
 
     # --- settings panel, slides in from the right ---
     panel_w = round(360 * scale)
