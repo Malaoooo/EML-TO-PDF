@@ -37,7 +37,7 @@ import extract_msg
 from bs4 import UnicodeDammit
 from pypdf import PdfWriter
 
-VERSION = '1.1.0'
+VERSION = '1.1.1'
 EXTS = {'.msg', '.eml'}
 APP_DIR = Path(os.environ.get('APPDATA', '.'), 'Email to PDF')
 DEFAULT_OUT = Path.home() / 'Documents' / 'Email PDFs'   # for emails dragged out of Outlook (they have no folder)
@@ -232,6 +232,9 @@ def setup_status():
             signed_in = winreg.QueryInfoKey(k)[0] > 0
     except OSError:
         signed_in = False
+    # Some setups leave that key empty; a signed-in classic Outlook always has a mailbox file (.ost / .pst)
+    mail_dirs = (Path(os.environ.get('LOCALAPPDATA', ''), 'Microsoft', 'Outlook'), Path.home() / 'Documents' / 'Outlook Files')
+    signed_in = signed_in or any(f.suffix.lower() in ('.ost', '.pst') for d in mail_dirs if d.is_dir() for f in d.iterdir())
     return [('Microsoft Word is installed', _reg_has(r'Word.Application\CLSID')),
             ('Classic Outlook is installed', _reg_has(r'Outlook.Application\CLSID')),
             ('Classic Outlook is signed in to an email account', signed_in)]
