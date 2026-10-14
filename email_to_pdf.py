@@ -37,12 +37,12 @@ import extract_msg
 from bs4 import UnicodeDammit
 from pypdf import PdfWriter
 
-VERSION = '1.1.1'
+VERSION = '1.2.0'
 EXTS = {'.msg', '.eml'}
 APP_DIR = Path(os.environ.get('APPDATA', '.'), 'Email to PDF')
 DEFAULT_OUT = Path.home() / 'Documents' / 'Email PDFs'   # for emails dragged out of Outlook (they have no folder)
 NAMINGS = {'file': 'Same name as the email file', 'date-subject': 'Date - Subject', 'subject': 'Subject'}
-DEFAULTS = {'out_dir': '', 'naming': 'file', 'attachments': True}
+DEFAULTS = {'out_dir': '', 'naming': 'file', 'attachments': True, 'theme': 'system'}
 PAGE_IMAGES = {'image/png', 'image/jpeg', 'image/gif', 'image/bmp', 'image/webp', 'image/svg+xml'}
 CID_RE = r'cid:([^"\'\s)>]+)'
 
@@ -379,7 +379,7 @@ def run_batch(job, settings, ready, events, cancel):
         if not files:
             events.put(('status', empty))
             return
-        events.put(('start', len(files)))
+        events.put(('queue', [f.name for f in files]))
         if ready and any(f.suffix.lower() == '.msg' for f in files):
             events.put(('status', 'Starting Outlook and Word...'))
             try:
@@ -387,10 +387,11 @@ def run_batch(job, settings, ready, events, cancel):
             except Exception:
                 pass   # every file then falls back to close match, which the Result column shows
         taken = set()
-        for i, f in enumerate(files, 1):
+        for i, f in enumerate(files):
             if cancel.is_set():
                 break
-            events.put(('status', f'Converting {i} of {len(files)}: {f.name}'))
+            events.put(('working', i, f'Converting {i + 1} of {len(files)}: {f.name}'))
+            src = None if temp else str(f)   # emails dragged from Outlook only existed temporarily
             try:
                 pdf, mode, added, skipped = convert(f, settings, printer, taken, fallback)
                 note = 'Exact copy' if mode == 'exact' else 'Close match'
@@ -398,11 +399,10 @@ def run_batch(job, settings, ready, events, cancel):
                     note += f' + {added} attachment{"s" * (added > 1)}'
                 if skipped:
                     note += f' ({skipped} skipped)'
-                events.put(('row', f.name, '✔  ' + note, mode, str(pdf)))
+                events.put(('row', i, '✔  ' + note, mode, str(pdf), src))
                 ok += 1
             except Exception as e:
-                events.put(('row', f.name, '✖  Failed (double-click for why)', 'failed', f'{f}\n\n{e}'))
-            events.put(('progress', i))
+                events.put(('row', i, '✖  Failed (double-click for why)', 'failed', f'{f}\n\n{e}', src))
     finally:
         if printer:
             printer.close()
@@ -426,11 +426,21 @@ def dark_mode():
 def style_titlebar(win, dark):
     try:   # Windows 11 dark title bar to match the theme
         import ctypes
-        win.update()
+        win.update_idletasks()
         hwnd = ctypes.windll.user32.GetParent(win.winfo_id())
         ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, 20, ctypes.byref(ctypes.c_int(dark)), 4)
     except Exception:
         pass
+
+
+def mix(a, b, t):
+    """Blend two #rrggbb colors; t=0 gives a, t=1 gives b."""
+    rgb = lambda c: [int(c[i:i + 2], 16) for i in (1, 3, 5)]
+    return '#' + ''.join(f'{round(x + (y - x) * t):02x}' for x, y in zip(rgb(a), rgb(b)))
+
+
+THEMES = {'system': 'Match Windows', 'light': 'Light', 'dark': 'Dark'}
+SPINNER = '◐◓◑◒'
 
 
 def main():
@@ -443,43 +453,38 @@ def main():
     from tkinter import ttk
     from tkinterdnd2 import COPY, DND_ALL, TkinterDnD
 
-    dark = dark_mode()
     settings = load_settings()
+    here = Path(getattr(sys, '_MEIPASS', Path(__file__).parent))
     root = TkinterDnD.Tk()
     root.title('Email to PDF')
-    root.geometry('860x680')
-    root.minsize(680, 540)
+    root.geometry('900x700')
+    root.minsize(700, 560)
     try:
-        root.iconbitmap(default=str(Path(getattr(sys, '_MEIPASS', Path(__file__).parent), 'icon.ico')))
+        root.iconbitmap(default=str(here / 'icon.ico'))
     except tk.TclError:
         pass
-    sv_ttk.set_theme('dark' if dark else 'light')
-    style_titlebar(root, dark)
-    green, amber, red, muted = (('#6ccb5f', '#fce100', '#ff99a4', '#9a9a9a') if dark
-                                else ('#0f7b0f', '#9d5d00', '#c42b1c', '#5f5f5f'))
+    logo = tk.PhotoImage(file=str(here / 'icon.png'))
     font = 'Segoe UI Variable Text'
     style = ttk.Style()
-    style.configure('Title.TLabel', font=('Segoe UI Variable Display', 22, 'bold'))
-    style.configure('Muted.TLabel', foreground=muted)
-    style.configure('CardTitle.TLabel', font=(font, 11, 'bold'))
-    style.configure('Treeview', rowheight=32)
+    pal = {}
 
-    page = ttk.Frame(root, padding=(28, 24))
+    page = ttk.Frame(root, padding=(28, 22))
     page.pack(fill='both', expand=True)
 
+    # header
     head = ttk.Frame(page)
     head.pack(fill='x')
     ttk.Label(head, text='Email to PDF', style='Title.TLabel').pack(side='left')
     ttk.Label(head, text=f'v{VERSION}', style='Muted.TLabel').pack(side='left', padx=10, pady=(12, 0))
-    ttk.Label(page, style='Muted.TLabel', text='Turn Outlook emails (.msg or .eml) into PDFs. '
-              'Drag emails or folders into this window, straight from Outlook too.').pack(anchor='w', pady=(2, 16))
+    gear = ttk.Button(head, text='⚙  Settings')
+    gear.pack(side='right')
 
     # mode card
     card = ttk.Frame(page, style='Card.TFrame', padding=(18, 14))
-    card.pack(fill='x')
+    card.pack(fill='x', pady=(14, 14))
     dot = ttk.Label(card, text='●', font=(font, 16))
     dot.pack(side='left', padx=(0, 12))
-    texts = ttk.Frame(card, style='Card.TFrame')
+    texts = ttk.Frame(card)
     texts.pack(side='left', fill='x', expand=True)
     mode_title = ttk.Label(texts, style='CardTitle.TLabel')
     mode_title.pack(anchor='w')
@@ -488,112 +493,144 @@ def main():
     setup_btn = ttk.Button(card, text='Set up')
     setup_btn.pack(side='right')
 
-    # options card: where to save, how to name, attachments
-    opts = ttk.Frame(page, style='Card.TFrame', padding=(18, 12))
-    opts.pack(fill='x', pady=(12, 0))
-    opts.columnconfigure(1, weight=1)
-    ttk.Label(opts, text='Save PDFs to').grid(row=0, column=0, sticky='w', padx=(0, 14), pady=4)
-    out_label = ttk.Label(opts, style='Muted.TLabel')
-    out_label.grid(row=0, column=1, sticky='w')
-    out_btns = ttk.Frame(opts, style='Card.TFrame')
-    out_btns.grid(row=0, column=2, sticky='e')
-    change_out = ttk.Button(out_btns, text='Change...')
-    change_out.pack(side='left')
-    reset_out = ttk.Button(out_btns, text='Next to each email')
-    reset_out.pack(side='left', padx=(6, 0))
-    ttk.Label(opts, text='File names').grid(row=1, column=0, sticky='w', padx=(0, 14), pady=4)
-    naming = ttk.Combobox(opts, state='readonly', width=30, values=list(NAMINGS.values()))
-    naming.set(NAMINGS.get(settings['naming'], NAMINGS['file']))
-    naming.grid(row=1, column=1, sticky='w')
-    attach_var = tk.BooleanVar(value=settings['attachments'])
-    attach = ttk.Checkbutton(opts, text='Add image and PDF attachments as pages after the email', variable=attach_var)
-    attach.grid(row=2, column=0, columnspan=3, sticky='w', pady=(6, 0))
+    content = ttk.Frame(page)
+    content.pack(fill='both', expand=True)
 
-    def show_out():
-        out_label.configure(text=settings['out_dir'] or 'Next to each email (dragged from Outlook: Documents\\Email PDFs)')
-        reset_out.configure(state='normal' if settings['out_dir'] else 'disabled')
+    # --- empty state: the drop zone ---
+    zone = tk.Canvas(content, highlightthickness=0, bd=0)
+    zone_state = {'hot': False}
+    pick = ttk.Button(zone, text='Choose emails', style='Accent.TButton')
+    folder = ttk.Button(zone, text='Choose folder')
 
-    def set_out(value):
-        settings['out_dir'] = value
-        save_settings(settings)
-        show_out()
+    def draw_zone(_=None):
+        zone.delete('all')
+        w, h = zone.winfo_width(), zone.winfo_height()
+        if w < 50 or h < 50:
+            return
+        hot = zone_state['hot']
+        fill = pal['zone_hot'] if hot else pal['zone']
+        line = pal['accent'] if hot else pal['dash']
+        zone.configure(bg=pal['bg'])
+        x0, y0, x1, y1, r = 2, 2, w - 3, h - 3, 18
+        zone.create_polygon(x0 + r, y0, x1 - r, y0, x1, y0, x1, y0 + r, x1, y1 - r, x1, y1, x1 - r, y1,
+                            x0 + r, y1, x0, y1, x0, y1 - r, x0, y0 + r, x0, y0, smooth=True, fill=fill, outline='')
+        dash = (8, 6)   # dashed border drawn by hand: straight edges + arc corners
+        for a, b in (((x0 + r, y0), (x1 - r, y0)), ((x0 + r, y1), (x1 - r, y1)),
+                     ((x0, y0 + r), (x0, y1 - r)), ((x1, y0 + r), (x1, y1 - r))):
+            horizontal = a[1] == b[1]
+            length = (b[0] - a[0]) if horizontal else (b[1] - a[1])
+            pos = 0
+            while pos < length:
+                end = min(pos + dash[0], length)
+                if horizontal:
+                    zone.create_line(a[0] + pos, a[1], a[0] + end, a[1], fill=line, width=2)
+                else:
+                    zone.create_line(a[0], a[1] + pos, a[0], a[1] + end, fill=line, width=2)
+                pos += sum(dash)
+        for cx, cy, start in ((x0, y0, 90), (x1 - 2 * r, y0, 0), (x0, y1 - 2 * r, 180), (x1 - 2 * r, y1 - 2 * r, 270)):
+            zone.create_arc(cx, cy, cx + 2 * r, cy + 2 * r, start=start, extent=90, style='arc', outline=line, width=2)
+        cx, cy = w / 2, h / 2
+        zone.create_image(cx, cy - 78, image=logo)
+        zone.create_text(cx, cy - 12, text='Drop emails here' if hot else 'Drag emails here',
+                         fill=pal['accent'] if hot else pal['fg'], font=(font, 16, 'bold'))
+        zone.create_text(cx, cy + 16, fill=pal['muted'], font=(font, 10),
+                         text='.msg or .eml files, folders, or emails straight from classic Outlook')
+        zone.create_window(cx - 8, cy + 62, window=pick, anchor='e')
+        zone.create_window(cx + 8, cy + 62, window=folder, anchor='w')
 
-    def on_naming(_):
-        settings['naming'] = next(k for k, v in NAMINGS.items() if v == naming.get())
-        save_settings(settings)
+    def set_hot(hot):
+        if zone_state['hot'] != hot:
+            zone_state['hot'] = hot
+            draw_zone()
 
-    def on_attach():
-        settings['attachments'] = attach_var.get()
-        save_settings(settings)
+    zone.bind('<Configure>', draw_zone)
+    zone.bind('<Enter>', lambda e: set_hot(True))
+    zone.bind('<Leave>', lambda e: set_hot(False) if not zone.winfo_containing(e.x_root, e.y_root) in (pick, folder) else None)
 
-    change_out.configure(command=lambda: (d := filedialog.askdirectory(parent=root)) and set_out(str(Path(d))))
-    reset_out.configure(command=lambda: set_out(''))
-    naming.bind('<<ComboboxSelected>>', on_naming)
-    attach.configure(command=on_attach)
-    show_out()
-
-    # actions
-    actions = ttk.Frame(page)
-    actions.pack(fill='x', pady=(16, 12))
-    pick = ttk.Button(actions, text='Choose emails', style='Accent.TButton')
-    pick.pack(side='left', ipadx=10)
-    folder = ttk.Button(actions, text='Choose folder')
-    folder.pack(side='left', padx=8)
-    cancel_btn = ttk.Button(actions, text='Cancel')
-    open_dir = ttk.Button(actions, text='Open PDF folder', state='disabled')
-    open_dir.pack(side='right')
-
-    # progress + results
-    progress = ttk.Progressbar(page, mode='determinate')
-    progress.pack(fill='x')
-    summary = ttk.Label(page, style='Muted.TLabel', text='Drop emails or folders anywhere in this window to convert them.')
+    # --- results view ---
+    results = ttk.Frame(content)
+    bar = ttk.Frame(results)
+    bar.pack(fill='x')
+    add_more = ttk.Button(bar, text='Add emails', style='Accent.TButton')
+    add_more.pack(side='left')
+    cancel_btn = ttk.Button(bar, text='Cancel')
+    clear_btn = ttk.Button(bar, text='Clear')
+    clear_btn.pack(side='right')
+    open_dir = ttk.Button(bar, text='Open PDF folder', state='disabled')
+    open_dir.pack(side='right', padx=8)
+    progress = ttk.Progressbar(results, mode='determinate')
+    progress.pack(fill='x', pady=(12, 0))
+    summary = ttk.Label(results, style='Muted.TLabel', text='')
     summary.pack(anchor='w', pady=(6, 10))
-    table = ttk.Frame(page)
+    table = ttk.Frame(results)
     table.pack(fill='both', expand=True)
     tree = ttk.Treeview(table, columns=('file', 'result'), show='headings', selectmode='browse')
     tree.heading('file', text='Email', anchor='w')
     tree.heading('result', text='Result', anchor='w')
     tree.column('file', anchor='w', stretch=True)
-    tree.column('result', anchor='w', width=300, stretch=False)
-    tree.tag_configure('exact', foreground=green)
-    tree.tag_configure('close', foreground=amber)
-    tree.tag_configure('failed', foreground=red)
+    tree.column('result', anchor='w', width=320, stretch=False)
     scroll = ttk.Scrollbar(table, orient='vertical', command=tree.yview)
     tree.configure(yscrollcommand=scroll.set)
     tree.pack(side='left', fill='both', expand=True)
     scroll.pack(side='right', fill='y')
-    pdfs, errors, last_dir = {}, {}, []
-    state = {'busy': False, 'closing': False}
+    ttk.Label(results, style='Muted.TLabel', text='Tip: drop more emails anywhere in the window. '
+              'Right-click a row for more options.').pack(anchor='w', pady=(8, 0))
+
+    rows = {}        # tree row id -> {'pdf': path, 'src': path, 'error': text}
+    batch = []       # tree row ids of the running batch, in order
+    state = {'busy': False, 'closing': False, 'working': None, 'spin': 0}
     events, cancel = queue.Queue(), threading.Event()
+    last_dir = []
 
-    def on_open(_):   # double-click: open the PDF, or show why it failed
-        row = tree.focus()
-        if row in pdfs:
-            os.startfile(pdfs[row])
-        elif row in errors:
-            messagebox.showerror('Could not convert', errors[row], parent=root)
+    def show(view):
+        zone.pack_forget()
+        results.pack_forget()
+        (results if view == 'results' else zone).pack(fill='both', expand=True)
 
-    tree.bind('<Double-1>', on_open)
+    # --- theme ---
+    def apply_theme():
+        dark = dark_mode() if settings['theme'] == 'system' else settings['theme'] == 'dark'
+        sv_ttk.set_theme('dark' if dark else 'light')
+        style_titlebar(root, dark)
+        pal.update(
+            bg=style.lookup('TFrame', 'background') or ('#1c1c1c' if dark else '#fafafa'),
+            fg='#ffffff' if dark else '#1c1c1c', muted='#9a9a9a' if dark else '#5f5f5f',
+            accent='#4cc2ff' if dark else '#005fb8', dash='#5a5a5a' if dark else '#b8b8b8',
+            zone='#232323' if dark else '#f3f3f3', zone_hot='#1a3346' if dark else '#e5f1fb',
+            exact='#6ccb5f' if dark else '#0f7b0f', close='#fce100' if dark else '#9d5d00',
+            failed='#ff99a4' if dark else '#c42b1c')
+        # ttk styles are per theme, so (re)configure them after every switch
+        style.configure('Title.TLabel', font=('Segoe UI Variable Display', 22, 'bold'))
+        style.configure('Muted.TLabel', foreground=pal['muted'])
+        style.configure('CardTitle.TLabel', font=(font, 11, 'bold'))
+        style.configure('Treeview', rowheight=34)
+        for tag in ('exact', 'close', 'failed'):
+            tree.tag_configure(tag, foreground=pal[tag])
+            for k in range(6):   # fade-in steps from muted to the final color
+                tree.tag_configure(f'{tag}{k}', foreground=mix(pal['muted'], pal[tag], k / 6))
+        tree.tag_configure('pending', foreground=pal['muted'])
+        tree.tag_configure('working', foreground=pal['accent'])
+        refresh()
+        draw_zone()
 
+    # --- mode card ---
     def refresh():
         ready = all(ok for _, ok in setup_status())
-        dot.configure(foreground=green if ready else amber)
+        dot.configure(foreground=pal['exact'] if ready else pal['close'])
         mode_title.configure(text='Exact copy is on' if ready else 'Close match')
         mode_desc.configure(text='Outlook emails (.msg) are printed by Outlook itself, exactly as Outlook prints them.'
                             if ready else 'Set up classic Outlook on this PC for PDFs that are an exact copy.')
         setup_btn.configure(text='Check setup' if ready else 'Set up')
         return ready
 
+    # --- running a batch ---
     def set_busy(busy):
         state['busy'] = busy
-        for w in (pick, folder, setup_btn, change_out, attach):
+        for w in (pick, folder, add_more, setup_btn, clear_btn):
             w.configure(state='disabled' if busy else 'normal')
-        naming.configure(state='disabled' if busy else 'readonly')
-        if not busy:
-            show_out()
         if busy:
             cancel_btn.configure(state='normal', text='Cancel')
-            cancel_btn.pack(side='left')
+            cancel_btn.pack(side='left', padx=8)
         else:
             cancel_btn.pack_forget()
         root.configure(cursor='watch' if busy else '')
@@ -602,9 +639,26 @@ def main():
         if state['busy'] or not job:
             return
         cancel.clear()
+        batch.clear()
         set_busy(True)
+        show('results')
         progress.configure(value=0)
+        summary.configure(text='Starting...')
         threading.Thread(target=run_batch, args=(job, dict(settings), refresh(), events, cancel), daemon=True).start()
+
+    def fade(row, tag, k=1):
+        if not tree.exists(row):
+            return
+        tree.item(row, tags=(f'{tag}{k}',) if k < 6 else (tag,))
+        if k < 6:
+            root.after(40, fade, row, tag, k + 1)
+
+    def spin():
+        row = state['working']
+        if row and tree.exists(row):
+            state['spin'] = (state['spin'] + 1) % len(SPINNER)
+            tree.set(row, 'result', f'{SPINNER[state["spin"]]}  Converting...')
+        root.after(120, spin)
 
     def poll():
         try:
@@ -612,27 +666,39 @@ def main():
                 kind, *data = events.get_nowait()
                 if kind == 'status':
                     summary.configure(text=data[0])
-                elif kind == 'start':
-                    progress.configure(maximum=data[0], value=0)
-                elif kind == 'progress':
-                    progress.configure(value=data[0])
+                elif kind == 'queue':   # all rows appear at once, newest batch on top
+                    progress.configure(maximum=len(data[0]), value=0)
+                    for i, name in enumerate(data[0]):
+                        batch.append(tree.insert('', i, values=(name, '…  Waiting'), tags=('pending',)))
+                    tree.see(batch[0])
+                elif kind == 'working':
+                    i, text = data
+                    state['working'] = batch[i]
+                    tree.item(batch[i], tags=('working',))
+                    summary.configure(text=text)
                 elif kind == 'row':
-                    name, result, tag, target = data
-                    row = tree.insert('', 0, values=(name, result), tags=(tag,))
-                    if tag == 'failed':
-                        errors[row] = target
-                    else:
-                        pdfs[row] = target
+                    i, result, tag, target, src = data
+                    row = batch[i]
+                    state['working'] = None
+                    tree.set(row, 'result', result)
+                    rows[row] = {'src': src, 'error' if tag == 'failed' else 'pdf': target}
+                    if tag != 'failed':
                         last_dir[:] = [Path(target).parent]
                         open_dir.configure(state='normal')
+                    progress.configure(value=i + 1)
+                    fade(row, tag)
                 elif kind == 'done':
+                    state['working'] = None
+                    for row in batch:   # anything never reached (cancelled)
+                        if row not in rows and tree.exists(row):
+                            tree.set(row, 'result', '–  Cancelled')
                     set_busy(False)
                     if state['closing']:
                         root.destroy()
                         return
         except queue.Empty:
             pass
-        root.after(100, poll)
+        root.after(80, poll)
 
     def on_cancel():
         cancel.set()
@@ -645,25 +711,146 @@ def main():
         else:
             root.destroy()
 
-    # drag and drop: files/folders from Explorer, or emails straight out of classic Outlook
-    def on_drop_enter(event):
-        summary.configure(text='Drop to convert')
-        return COPY
+    def clear():
+        tree.delete(*tree.get_children())
+        rows.clear()
+        last_dir.clear()
+        open_dir.configure(state='disabled')
+        show('zone')
 
+    # --- row actions: double-click and right-click menu ---
+    def open_row(row):
+        info = rows.get(row, {})
+        if info.get('pdf'):
+            os.startfile(info['pdf'])
+        elif info.get('error'):
+            messagebox.showerror('Could not convert', info['error'], parent=root)
+
+    def reveal(path):
+        subprocess.Popen(['explorer', '/select,', str(Path(path))])
+
+    menu = tk.Menu(root, tearoff=False)
+
+    def on_right_click(e):
+        row = tree.identify_row(e.y)
+        if not row or row not in rows:
+            return
+        tree.selection_set(row)
+        info = rows[row]
+        pdf, src = info.get('pdf'), info.get('src')
+        menu.delete(0, 'end')
+        menu.add_command(label='Open PDF', command=lambda: os.startfile(pdf), state='normal' if pdf else 'disabled')
+        menu.add_command(label='Show in folder', command=lambda: reveal(pdf), state='normal' if pdf else 'disabled')
+        menu.add_command(label='Open original email', command=lambda: os.startfile(src),
+                         state='normal' if src and os.path.exists(src) else 'disabled')
+        menu.add_separator()
+        menu.add_command(label='Copy PDF path', state='normal' if pdf else 'disabled',
+                         command=lambda: (root.clipboard_clear(), root.clipboard_append(pdf)))
+        if info.get('error'):
+            menu.add_command(label='Why did it fail?', command=lambda: open_row(row))
+        menu.tk_popup(e.x_root, e.y_root)
+
+    tree.bind('<Double-1>', lambda e: open_row(tree.identify_row(e.y)))
+    tree.bind('<Button-3>', on_right_click)
+
+    # --- drag and drop: files/folders from Explorer, or emails straight out of classic Outlook ---
     def on_drop(event):
+        set_hot(False)
         paths = [p for p in root.tk.splitlist(event.data) if os.path.exists(p)] if event.data else []
         # Outlook drags carry no files; the dragged emails are Outlook's current selection
         root.after(50, start, paths or 'outlook')
         return COPY   # never MOVE, so Outlook keeps its emails
 
+    def on_drop_enter(_):
+        set_hot(True)
+        return COPY
+
     root.drop_target_register(DND_ALL)
     root.dnd_bind('<<DropEnter>>', on_drop_enter)
-    root.dnd_bind('<<DropLeave>>', lambda e: summary.configure(text='Drop emails or folders anywhere in this window to convert them.'))
+    root.dnd_bind('<<DropPosition>>', lambda e: COPY)
+    root.dnd_bind('<<DropLeave>>', lambda e: set_hot(False))
     root.dnd_bind('<<Drop>>', on_drop)
 
+    # --- settings panel, slides in from the right ---
+    panel = ttk.Frame(root, style='Card.TFrame', padding=(22, 18))
+    panel_w = 360
+    panel_state = {'open': False, 'x': 0}
+
+    def place_panel():
+        panel.place(relx=1.0, x=panel_w - panel_state['x'], y=0, relheight=1.0, width=panel_w, anchor='ne')
+
+    def slide(target, step=0):
+        panel_state['x'] = round(panel_w * ((step / 8) if target else (1 - step / 8)))
+        place_panel()
+        if step < 8:
+            root.after(15, slide, target, step + 1)
+        elif not target:
+            panel.place_forget()
+
+    def toggle_panel(_=None):
+        panel_state['open'] = not panel_state['open']
+        panel.lift()
+        slide(panel_state['open'])
+
+    top = ttk.Frame(panel)
+    top.pack(fill='x', pady=(0, 14))
+    ttk.Label(top, text='Settings', font=(font, 15, 'bold')).pack(side='left')
+    ttk.Button(top, text='✕', width=3, command=toggle_panel).pack(side='right')
+
+    def section(title):
+        ttk.Label(panel, text=title, style='CardTitle.TLabel').pack(anchor='w', pady=(12, 4))
+
+    section('Save PDFs to')
+    out_label = ttk.Label(panel, style='Muted.TLabel', wraplength=panel_w - 50, justify='left')
+    out_label.pack(anchor='w')
+    out_btns = ttk.Frame(panel)
+    out_btns.pack(anchor='w', pady=(6, 0))
+    change_out = ttk.Button(out_btns, text='Change...')
+    change_out.pack(side='left')
+    reset_out = ttk.Button(out_btns, text='Next to each email')
+    reset_out.pack(side='left', padx=(6, 0))
+
+    section('File names')
+    naming = ttk.Combobox(panel, state='readonly', values=list(NAMINGS.values()))
+    naming.set(NAMINGS.get(settings['naming'], NAMINGS['file']))
+    naming.pack(fill='x')
+
+    section('Attachments')
+    attach_var = tk.BooleanVar(value=settings['attachments'])
+    attach = ttk.Checkbutton(panel, text='Add image and PDF attachments\nas pages after the email', variable=attach_var)
+    attach.pack(anchor='w')
+
+    section('Theme')
+    theme_var = tk.StringVar(value=settings['theme'])
+    for key, label in THEMES.items():
+        ttk.Radiobutton(panel, text=label, value=key, variable=theme_var,
+                        command=lambda: (settings.update(theme=theme_var.get()), save_settings(settings), apply_theme())
+                        ).pack(anchor='w', pady=2)
+
+    def show_out():
+        out_label.configure(text=settings['out_dir'] or 'Next to each email.\nEmails dragged from Outlook go to Documents\\Email PDFs.')
+        reset_out.configure(state='normal' if settings['out_dir'] else 'disabled')
+
+    def set_out(value):
+        settings['out_dir'] = value
+        save_settings(settings)
+        show_out()
+
+    def on_naming(_):
+        settings['naming'] = next(k for k, v in NAMINGS.items() if v == naming.get())
+        save_settings(settings)
+
+    change_out.configure(command=lambda: (d := filedialog.askdirectory(parent=root)) and set_out(str(Path(d))))
+    reset_out.configure(command=lambda: set_out(''))
+    naming.bind('<<ComboboxSelected>>', on_naming)
+    attach.configure(command=lambda: (settings.update(attachments=attach_var.get()), save_settings(settings)))
+    show_out()
+
+    # --- setup dialog ---
     skip_file = APP_DIR / 'setup-done'
 
     def setup():
+        dark = sv_ttk.get_theme() == 'dark'
         win = tk.Toplevel(root)
         win.title('Set up exact copy')
         win.transient(root)
@@ -671,25 +858,25 @@ def main():
         style_titlebar(win, dark)
         body = ttk.Frame(win, padding=24)
         body.pack(fill='both', expand=True)
-        ttk.Label(body, text='Set up exact copy', style='CardTitle.TLabel', font=(font, 15, 'bold')).pack(anchor='w')
+        ttk.Label(body, text='Set up exact copy', font=(font, 15, 'bold')).pack(anchor='w')
         ttk.Label(body, style='Muted.TLabel', wraplength=500, justify='left', text=(
             'For PDFs that match exactly what Outlook prints, this PC needs Microsoft Word and classic Outlook '
             '(the Microsoft 365 / Office desktop apps), signed in to an email account once. '
             'Without them the app still works and makes a close match.')).pack(anchor='w', pady=(4, 16))
-        rows = ttk.Frame(body, style='Card.TFrame', padding=(16, 10))
-        rows.pack(fill='x')
+        checklist = ttk.Frame(body, style='Card.TFrame', padding=(16, 10))
+        checklist.pack(fill='x')
         ttk.Label(body, style='Muted.TLabel', wraplength=500, justify='left', text=(
             'Word or Outlook missing: install the Microsoft 365 / Office desktop apps.\n'
             'Not signed in: click "Open classic Outlook", add your email account, then close Outlook. '
             'If the new Outlook opens instead, turn off its "New Outlook" switch (top right) first.')).pack(anchor='w', pady=16)
 
         def check():
-            for w in rows.winfo_children():
+            for w in checklist.winfo_children():
                 w.destroy()
             for label, ok in setup_status():
-                line = ttk.Frame(rows, style='Card.TFrame')
+                line = ttk.Frame(checklist)
                 line.pack(fill='x', pady=3)
-                ttk.Label(line, text='✔' if ok else '✖', foreground=green if ok else red,
+                ttk.Label(line, text='✔' if ok else '✖', foreground=pal['exact'] if ok else pal['failed'],
                           font=(font, 11, 'bold'), width=3).pack(side='left')
                 ttk.Label(line, text=label).pack(side='left')
             refresh()
@@ -714,19 +901,28 @@ def main():
         check()
         win.grab_set()
 
+    def choose_emails():
+        start(list(filedialog.askopenfilenames(parent=root, filetypes=[('Outlook emails', '*.msg *.eml'), ('All files', '*.*')])))
+
     setup_btn.configure(command=setup)
-    pick.configure(command=lambda: start(list(filedialog.askopenfilenames(
-        parent=root, filetypes=[('Outlook emails', '*.msg *.eml'), ('All files', '*.*')]))))
+    gear.configure(command=toggle_panel)
+    pick.configure(command=choose_emails)
+    add_more.configure(command=choose_emails)
     folder.configure(command=lambda: start([d] if (d := filedialog.askdirectory(parent=root)) else []))
     open_dir.configure(command=lambda: last_dir and os.startfile(last_dir[0]))
     cancel_btn.configure(command=on_cancel)
+    clear_btn.configure(command=clear)
+    root.bind('<Escape>', lambda e: toggle_panel() if panel_state['open'] else None)
     root.protocol('WM_DELETE_WINDOW', on_close)
 
+    apply_theme()
+    show('zone')
     if not refresh() and not skip_file.exists():
         root.after(300, setup)   # first launch on a PC that isn't set up yet
     if len(sys.argv) > 1:
         root.after(200, start, sys.argv[1:])
-    root.after(100, poll)
+    root.after(80, poll)
+    root.after(120, spin)
     root.mainloop()
 
 

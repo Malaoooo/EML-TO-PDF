@@ -5,7 +5,7 @@ cd /d "%~dp0"
 if not exist .venv python -m venv .venv || exit /b 1
 .venv\Scripts\python -m pip install --quiet --disable-pip-version-check extract-msg pywin32 sv-ttk tkinterdnd2 pypdf pyinstaller || exit /b 1
 .venv\Scripts\python test_email_to_pdf.py || exit /b 1
-.venv\Scripts\python -m PyInstaller --noconfirm --onefile --windowed --icon icon.ico --add-data "icon.ico;." ^
+.venv\Scripts\python -m PyInstaller --noconfirm --onefile --windowed --icon icon.ico --add-data "icon.ico;." --add-data "icon.png;." ^
     --collect-data sv_ttk --collect-all tkinterdnd2 --name "Email to PDF" email_to_pdf.py || exit /b 1
 echo.
 echo Built: %~dp0dist\Email to PDF.exe

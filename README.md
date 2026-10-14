@@ -9,10 +9,11 @@ Turns Outlook emails (`.msg` and `.eml`) into PDFs that look like they do in Out
 ## Using it
 
 - Drag emails or folders into the window, including straight out of classic Outlook, or click **Choose emails** / **Choose folder**, or drop them onto the app icon.
-- **Save PDFs to**: next to each email (default) or a folder you pick. Emails dragged from Outlook go to `Documents\Email PDFs` unless you pick a folder.
+- In **Settings** (gear, top right): **Save PDFs to**: next to each email (default) or a folder you pick. Emails dragged from Outlook go to `Documents\Email PDFs` unless you pick a folder.
 - **File names**: same as the email file, *Date - Subject*, or *Subject*.
 - **Attachments**: image and PDF attachments are added as pages after the email (can be turned off). Other attachments are listed by name.
-- Converting runs in the background and can be cancelled. Double-click a row in the results to open its PDF.
+- Converting runs in the background and can be cancelled. Double-click a row in the results to open its PDF; right-click for Show in folder, Open original email and Copy PDF path.
+- Theme: Light, Dark, or match Windows (in Settings).
 
 Settings are remembered in `%APPDATA%\Email to PDF`.
 
