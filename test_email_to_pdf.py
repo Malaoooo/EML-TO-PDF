@@ -10,7 +10,7 @@ from pathlib import Path
 
 from pypdf import PdfReader, PdfWriter
 
-from email_to_pdf import build_html, convert, load_eml, parse_date, range_dates, setup_status
+from email_to_pdf import EdgePrinter, build_html, convert, expand, load_eml, parse_date, range_dates, setup_status
 
 
 def png(w, h, rgb):
@@ -67,6 +67,28 @@ with tempfile.TemporaryDirectory() as tmp:
     assert len(PdfReader(pdf).pages) == base_pages + 3, 'attachment pages missing'
     assert not list(out.glob('*.tmp.pdf')), 'temp files left behind'
     assert len(setup_status()) == 3, 'setup checklist broken'
+
+    # folder scan: real emails only; program language files, Recycle Bin and app internals are skipped
+    scan = Path(tmp, 'scan')
+    for sub in ('mail', 'app/_internal/msgs', '$Recycle.Bin', 'tcl/msgs'):
+        Path(scan, sub).mkdir(parents=True)
+    Path(scan, 'mail/real.eml').write_bytes(bytes(msg))
+    Path(scan, 'mail/outlook.msg').write_bytes(b'\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1' + b'\0' * 504)
+    Path(scan, 'app/_internal/msgs/af.msg').write_text('namespace eval ::tcl::clock {}')
+    Path(scan, '$Recycle.Bin/$IH4JAI3.msg').write_bytes(b'\x02\0\0\0')
+    Path(scan, 'tcl/msgs/ar_jo.msg').write_text('::msgcat::mcset ar_JO DAYS_OF_WEEK_ABBREV')
+    Path(scan, 'mail/notes.eml').write_text('just some text, not an email')
+    skipped = {}
+    assert [p.name for p in expand([scan], skipped)] == ['outlook.msg', 'real.eml'], 'scan picked up non-emails'
+    assert skipped['n'] == 2, skipped   # ar_jo.msg and notes.eml were looked at and rejected
+
+    # one shared Edge for a batch gives the same PDFs as a fresh Edge per email
+    edge = EdgePrinter()
+    try:
+        shared, *_ = convert(eml, {'out_dir': str(Path(tmp, 'shared')), 'naming': 'file', 'attachments': True}, edge=edge)
+    finally:
+        edge.close()
+    assert not edge.broken and len(PdfReader(shared).pages) == base_pages + 3, 'shared Edge output differs'
 
 # dates typed into "Export from Outlook"
 d = datetime.date

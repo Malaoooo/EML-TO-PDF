@@ -3,8 +3,8 @@
 Turns Outlook emails (`.msg` and `.eml`) into PDFs that look like they do in Outlook. Windows 10/11.
 
 **Download** from the [Releases](../../releases) page:
-- `Email-to-PDF-Setup.exe`: installs the app with Start menu and desktop shortcuts (no admin rights needed).
-- `Email to PDF.exe`: the app on its own, no install.
+- `Email-to-PDF-Setup.exe` (recommended, especially on slower PCs): installs the app with Start menu and desktop shortcuts, no admin rights needed. The installed app starts noticeably faster.
+- `Email to PDF.exe`: the app on its own, no install (slower to start, since it unpacks itself each time).
 
 ## Using it
 
@@ -15,6 +15,8 @@ Turns Outlook emails (`.msg` and `.eml`) into PDFs that look like they do in Out
 - **Attachments**: image and PDF attachments are added as pages after the email (can be turned off). Other attachments are listed by name.
 - Converting runs in the background and can be cancelled. Each row shows the email's subject, sender and date, with an icon for the result. Enter or double-click opens a PDF; right-click (or Shift+F10) for Show in folder, Open original email and Copy PDF path. When a batch finishes you get where the PDFs went, **Open folder**, and **Retry failed** if anything failed.
 - Theme: Light, Dark, or match Windows (in Settings).
+
+When you choose a folder, only real Outlook emails are picked up: files are checked by their content, and system, hidden and program folders (Recycle Bin, AppData, app internals) are skipped. Conversions share one background Edge and run at low priority, so the PC stays usable.
 
 Settings are remembered in `%APPDATA%\Email to PDF`.
 

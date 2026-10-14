@@ -27,7 +27,9 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import socket
 import threading
+import time
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox
@@ -39,7 +41,7 @@ import extract_msg
 from bs4 import UnicodeDammit
 from pypdf import PdfWriter
 
-VERSION = '1.4.0'
+VERSION = '1.5.0'
 EXTS = {'.msg', '.eml'}
 APP_DIR = Path(os.environ.get('APPDATA', '.'), 'Email to PDF')
 DEFAULT_OUT = Path.home() / 'Documents' / 'Email PDFs'   # for emails dragged out of Outlook (they have no folder)
@@ -156,6 +158,14 @@ def build_html(mail):
     return PAGE_HEAD + page
 
 
+# Light, polite Edge: no extras, below-normal CPU priority so a slow PC stays usable while converting.
+EDGE_FLAGS = ['--headless', '--disable-gpu', '--no-first-run', '--no-default-browser-check', '--disable-extensions',
+              '--disable-background-networking', '--disable-sync', '--disable-component-update', '--mute-audio',
+              '--disable-features=Translate,OptimizationHints,MediaRouter']
+QUIET = dict(stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+             creationflags=subprocess.CREATE_NO_WINDOW | subprocess.BELOW_NORMAL_PRIORITY_CLASS)
+
+
 def find_browser():
     for base in ('ProgramFiles(x86)', 'ProgramFiles', 'LOCALAPPDATA'):
         for rel in (r'Microsoft\Edge\Application\msedge.exe', r'Google\Chrome\Application\chrome.exe'):
@@ -164,21 +174,151 @@ def find_browser():
     raise RuntimeError('Microsoft Edge (or Google Chrome) is needed but was not found')
 
 
-def to_pdf(page, pdf):
-    # ponytail: one Edge launch per email (~1-2 s each); drive one Edge over DevTools if huge batches get slow
+class EdgePrinter:
+    """One headless Edge for a whole batch, driven over the DevTools protocol (a tiny stdlib WebSocket client).
+
+    Starting Edge costs seconds on a slow PC; reusing one makes each email after the first much faster.
+    It starts on first use; if anything about it fails, to_pdf falls back to a one-off Edge per email."""
+
+    def __init__(self):
+        self.proc = self.sock = None
+        self.broken = False
+        self.n = 0
+
+    def _start(self):
+        self.tmp = tempfile.mkdtemp(prefix='email-to-pdf-edge-')
+        self.proc = subprocess.Popen([str(find_browser()), *EDGE_FLAGS, '--remote-debugging-port=0',
+                                      f'--user-data-dir={self.tmp}', 'about:blank'], **QUIET)
+        port_file, deadline = Path(self.tmp, 'DevToolsActivePort'), time.time() + 90   # slow PCs start slowly
+        while True:
+            lines = port_file.read_text().split() if port_file.exists() else []
+            if len(lines) >= 2:
+                break
+            if self.proc.poll() is not None or time.time() > deadline:
+                raise RuntimeError('Edge did not start')
+            time.sleep(0.1)
+        port, path = lines[:2]
+        self.sock = socket.create_connection(('127.0.0.1', int(port)), timeout=180)
+        key = base64.b64encode(os.urandom(16)).decode()
+        self.sock.sendall(f'GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n'
+                          f'Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n'.encode())
+        reply = b''
+        while b'\r\n\r\n' not in reply:
+            chunk = self.sock.recv(4096)
+            if not chunk:
+                raise RuntimeError('Edge closed the connection')
+            reply += chunk
+        if b' 101 ' not in reply.split(b'\r\n', 1)[0]:
+            raise RuntimeError('Edge refused the connection')
+        self.buf, self.events = reply.split(b'\r\n\r\n', 1)[1], []
+        target = self.call('Target.createTarget', url='about:blank')['targetId']
+        self.session = self.call('Target.attachToTarget', targetId=target, flatten=True)['sessionId']
+        self.call('Page.enable', in_page=True)
+
+    # --- minimal WebSocket framing (RFC 6455): client frames masked, server frames not ---
+    def _send(self, text):
+        data, head = text.encode(), bytearray([0x81])
+        n = len(data)
+        head += bytes([0x80 | n]) if n < 126 else bytes([0x80 | 126]) + n.to_bytes(2, 'big') if n < 65536 \
+            else bytes([0x80 | 127]) + n.to_bytes(8, 'big')
+        mask = os.urandom(4)
+        self.sock.sendall(bytes(head) + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(data)))
+
+    def _read(self, n):
+        while len(self.buf) < n:
+            chunk = self.sock.recv(max(65536, n - len(self.buf)))
+            if not chunk:
+                raise RuntimeError('Edge closed the connection')
+            self.buf += chunk
+        out, self.buf = self.buf[:n], self.buf[n:]
+        return out
+
+    def _recv(self):
+        message = b''
+        while True:
+            b0, b1 = self._read(2)
+            n = b1 & 0x7F
+            n = int.from_bytes(self._read(2 if n == 126 else 8), 'big') if n >= 126 else n
+            payload = self._read(n)
+            if b0 & 0x0F == 8:
+                raise RuntimeError('Edge closed the connection')
+            if b0 & 0x0F in (9, 10):   # ping / pong: not used by Edge here
+                continue
+            message += payload
+            if b0 & 0x80:
+                return json.loads(message)
+
+    def call(self, method, in_page=False, **params):
+        self.n += 1
+        msg = {'id': self.n, 'method': method, 'params': params}
+        if in_page:
+            msg['sessionId'] = self.session
+        self._send(json.dumps(msg))
+        while True:
+            reply = self._recv()
+            if reply.get('id') == self.n:
+                if 'error' in reply:
+                    raise RuntimeError(reply['error'].get('message', 'Edge error'))
+                return reply.get('result', {})
+            self.events.append(reply.get('method'))
+
+    def print(self, page, pdf):
+        if self.proc is None:
+            self._start()
+        src = Path(self.tmp, f'email-{self.n}.html')
+        src.write_text(page, encoding='utf-8-sig')   # BOM beats whatever charset the email's HTML declares
+        try:
+            self.events.clear()
+            self.call('Page.navigate', in_page=True, url=src.as_uri())
+            deadline = time.time() + 30   # online images may be slow; print what has loaded by then
+            self.sock.settimeout(1)
+            while 'Page.loadEventFired' not in self.events and time.time() < deadline:
+                try:
+                    self.events.append(self._recv().get('method'))
+                except socket.timeout:
+                    pass
+            self.sock.settimeout(180)
+            data = self.call('Page.printToPDF', in_page=True, printBackground=True, preferCSSPageSize=True,
+                             displayHeaderFooter=False)['data']
+            pdf.write_bytes(base64.b64decode(data))
+        finally:
+            src.unlink(missing_ok=True)
+
+    def close(self):
+        if self.proc is None:
+            return
+        try:
+            self.call('Browser.close')
+        except Exception:
+            pass
+        try:
+            self.proc.wait(10)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
+        if self.sock:
+            self.sock.close()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+
+def to_pdf(page, pdf, edge=None):
     pdf.unlink(missing_ok=True)
+    if edge and not edge.broken:
+        try:
+            return edge.print(page, pdf)
+        except Exception:
+            edge.broken = True   # e.g. blocked by security software: use a one-off Edge for the rest
+            pdf.unlink(missing_ok=True)
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
         src = Path(tmp, 'email.html')
-        src.write_text(page, encoding='utf-8-sig')   # BOM beats whatever charset the email's HTML declares
-        subprocess.run([str(find_browser()), '--headless', '--disable-gpu', '--no-first-run', '--no-pdf-header-footer',
+        src.write_text(page, encoding='utf-8-sig')
+        subprocess.run([str(find_browser()), *EDGE_FLAGS, '--no-pdf-header-footer', '--timeout=30000',
                         f'--user-data-dir={Path(tmp, "profile")}', f'--print-to-pdf={pdf}', src.as_uri()],
-                       stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120,
-                       creationflags=subprocess.CREATE_NO_WINDOW)
+                       timeout=300, **QUIET)
     if not pdf.exists():
         raise RuntimeError('Edge did not produce a PDF')
 
 
-def append_attachments(pdf, mail):
+def append_attachments(pdf, mail, edge=None):
     """Adds image and PDF attachments as pages after the email. Returns (added, skipped)."""
     images, pdfs = [], []
     for f in real_attachments(mail):
@@ -199,7 +339,7 @@ def append_attachments(pdf, mail):
         shots = pdf.with_name(pdf.stem + '.attachments.tmp.pdf')
         to_pdf('<!DOCTYPE html><style>@page{margin:0.5in}body{margin:0;font:10pt Calibri,Arial,sans-serif;color:#555}'
                'section{break-after:page}section:last-child{break-after:auto}p{margin:0 0 6pt}'
-               'img{display:block;max-width:100%;max-height:9.2in;object-fit:contain}</style>' + page, shots)
+               'img{display:block;max-width:100%;max-height:9.2in;object-fit:contain}</style>' + page, shots, edge)
         try:
             writer.append(str(shots))
             added += len(images)
@@ -313,7 +453,7 @@ def pdf_target(src, mail, settings, taken, fallback_dir=None):
     return pdf
 
 
-def convert(path, settings=None, printer=None, taken=None, fallback_dir=None, skip_existing=False, info=None):
+def convert(path, settings=None, printer=None, taken=None, fallback_dir=None, skip_existing=False, info=None, edge=None):
     """Returns (pdf path, 'exact' / 'close' / 'skipped', attachments added, attachments skipped).
 
     `info`, if given, is filled with the email's subject, sender and sent date for display."""
@@ -334,16 +474,68 @@ def convert(path, settings=None, printer=None, taken=None, fallback_dir=None, sk
         except Exception:
             pass   # e.g. a protected or odd .msg: still produce a close match
     if mode == 'close':
-        to_pdf(build_html(mail), pdf)
-    added, skipped = append_attachments(pdf, mail) if settings['attachments'] else (0, 0)
+        to_pdf(build_html(mail), pdf, edge)
+    added, skipped = append_attachments(pdf, mail, edge) if settings['attachments'] else (0, 0)
     return pdf, mode, added, skipped
 
 
-def expand(paths):
+# Folders never holding the user's emails: skipping them keeps a scan of Desktop or a whole drive fast.
+SKIP_DIRS = {'appdata', 'node_modules', 'windows', 'program files', 'program files (x86)', 'programdata',
+             'site-packages', '_internal', '__pycache__', '.git', '.venv', 'venv'}
+HIDDEN = 0x2 | 0x4   # FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM
+EML_HEADER = re.compile(rb'^(from|received|subject|date|to|message-id|mime-version|return-path|delivered-to):', re.I | re.M)
+
+
+def skip_dir(top, name):
+    if name.startswith(('$', '.')) or name.lower() in SKIP_DIRS:
+        return True
+    full = os.path.join(top, name)
+    try:   # hidden/system folders, and junctions (they can loop back on themselves)
+        return bool(os.stat(full, follow_symlinks=False).st_file_attributes & HIDDEN) or os.path.isjunction(full)
+    except OSError:   # can't read it: nothing of the user's in there
+        return True
+
+
+def is_email(path):
+    """Checks the content, not just the name: a .msg must be an Outlook (OLE) file, an .eml must start with mail headers."""
+    try:
+        with open(path, 'rb') as f:
+            head = f.read(4096)
+    except OSError:
+        return False
+    if path.suffix.lower() == '.msg':
+        return head.startswith(b'\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1')
+    return bool(EML_HEADER.search(head))
+
+
+def expand(paths, skipped=None, cancel=None, on_folder=None):
+    """Email files in the given files/folders. Non-email lookalikes are counted in skipped['n'], if given.
+
+    on_folder(n) reports progress while scanning big folders; setting `cancel` stops the scan."""
+    skipped = skipped if skipped is not None else {}
+    skipped.setdefault('n', 0)
+
+    def keep(p):
+        if p.suffix.lower() not in EXTS:
+            return False
+        if is_email(p):
+            return True
+        skipped['n'] += 1
+        return False
+
     for p in map(Path, paths):
         if p.is_dir():
-            yield from sorted(f for f in p.rglob('*') if f.suffix.lower() in EXTS)
-        elif p.suffix.lower() in EXTS:
+            found, n = [], 0
+            for top, dirs, files in os.walk(p):
+                n += 1
+                if cancel is not None and cancel.is_set():
+                    break
+                if on_folder and n % 200 == 0:
+                    on_folder(n)
+                dirs[:] = [d for d in dirs if not skip_dir(top, d)]
+                found += [f for f in (Path(top, name) for name in files) if keep(f)]
+            yield from sorted(found)
+        elif keep(p):
             yield p
 
 
@@ -455,7 +647,9 @@ def run_batch(job, settings, ready, events, cancel):
     import pythoncom
     pythoncom.CoInitialize()
     temp = printer = None
+    edge = EdgePrinter()
     ok = failed = done_before = 0
+    not_email = {'n': 0}
     tasks = []   # (row label, open() -> (.msg/.eml path, output folder or None, original path or None))
     skip_existing = False
     try:
@@ -491,12 +685,16 @@ def run_batch(job, settings, ready, events, cancel):
             tasks = [(f'{t[3].as_posix()}  \u203A  {t[2]}', lambda t=t: save(*t)) for t in found]
             settings = {**settings, 'out_dir': ''}   # each email goes to its mirrored folder under `base`
         else:
-            tasks = [(f.name, lambda f=f: (f, None, str(f))) for f in expand(job)]
+            events.put(('status', 'Looking for emails\u2026'))
+            tasks = [(f.name, lambda f=f: (f, None, str(f))) for f in expand(job, not_email, cancel, lambda n: events.put(('status', f'Looking for emails… {n:,} folders checked')))]
+            if not tasks and not_email['n']:
+                empty = (f"No Outlook emails there. {not_email['n']} file{'s' * (not_email['n'] > 1)} ending in .msg/.eml "
+                         "aren't emails (for example, program language files), so they were skipped.")
         if not tasks:
             events.put(('empty', empty))
             return
         events.put(('queue', [label for label, _ in tasks]))
-        if ready and (not isinstance(job, list) or any(Path(p).suffix.lower() == '.msg' for p in expand(job))):
+        if ready and (not isinstance(job, list) or any(label.lower().endswith('.msg') for label, _ in tasks)):
             events.put(('status', 'Starting Outlook and Word\u2026'))
             try:
                 printer = OutlookPrinter()
@@ -511,7 +709,7 @@ def run_batch(job, settings, ready, events, cancel):
             info = {}
             try:
                 path, out_dir, src = open_task()
-                pdf, mode, added, skipped = convert(path, settings, printer, taken, out_dir, skip_existing, info)
+                pdf, mode, added, skipped = convert(path, settings, printer, taken, out_dir, skip_existing, info, edge)
                 meta = (info.get('subject') or '(no subject)', sender_name(info.get('sender')), short_date(info.get('sent')))
                 if mode == 'skipped':
                     events.put(('row', i, 'skipped', 'Already converted', str(pdf), src, meta))
@@ -541,6 +739,7 @@ def run_batch(job, settings, ready, events, cancel):
     finally:
         if printer:
             printer.close()
+        edge.close()
         if temp:
             shutil.rmtree(temp, ignore_errors=True)
         if isinstance(job, dict) and job.get('quit_outlook'):
@@ -551,7 +750,7 @@ def run_batch(job, settings, ready, events, cancel):
             except Exception:
                 pass
         if tasks:
-            events.put(('finished', ok, failed, done_before, len(tasks), cancel.is_set()))
+            events.put(('finished', ok, failed, done_before, len(tasks), cancel.is_set(), not_email['n']))
         events.put(('done',))
         pythoncom.CoUninitialize()
 
@@ -866,7 +1065,7 @@ def main():
         except ValueError:   # PDFs on different drives
             return dirs[-1]
 
-    def finish(ok, failed, before, total, cancelled):
+    def finish(ok, failed, before, total, cancelled, not_email=0):
         where = batch_root()
         parts = []
         if ok:
@@ -877,6 +1076,8 @@ def main():
             parts.append(f'{failed} failed')
         if cancelled:
             parts.append(f'cancelled after {ok + failed + before} of {total}')
+        if not_email:
+            parts.append(f"{not_email} non-email file{'s' * (not_email > 1)} skipped")
         summary.configure(text=' \u00B7 '.join(parts) or 'Nothing was converted.', style='Done.TLabel')
         if where:
             open_dir.configure(state='normal', style='Accent.TButton')
@@ -1334,6 +1535,11 @@ def main():
     if len(sys.argv) > 1:
         root.after(200, start, sys.argv[1:])
     root.after(80, poll)
+    try:   # the packaged app shows a splash while it unpacks; the window is ready now
+        import pyi_splash
+        pyi_splash.close()
+    except ImportError:
+        pass
     root.mainloop()
 
 

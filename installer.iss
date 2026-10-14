@@ -1,4 +1,5 @@
-; Inno Setup script: builds dist\Email-to-PDF-Setup.exe from dist\Email to PDF.exe.
+; Inno Setup script: builds dist\Email-to-PDF-Setup.exe from the unpacked build in dist\app\Email to PDF\
+; (unpacked starts much faster than the single-file exe, which matters on slow PCs).
 ; Per-user install, no admin rights needed. Build: ISCC /DAppVersion=1.2.3 installer.iss
 
 #ifndef AppVersion
@@ -27,7 +28,7 @@ SolidCompression=yes
 Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Shortcuts:"
 
 [Files]
-Source: "dist\Email to PDF.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "dist\app\Email to PDF\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
 Name: "{group}\Email to PDF"; Filename: "{app}\Email to PDF.exe"
