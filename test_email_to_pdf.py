@@ -1,4 +1,5 @@
 """Self-check: builds a sample .eml (HTML + inline image + attachments) and converts it. Run: python test_email_to_pdf.py"""
+import datetime
 import io
 import struct
 import tempfile
@@ -9,7 +10,7 @@ from pathlib import Path
 
 from pypdf import PdfReader, PdfWriter
 
-from email_to_pdf import build_html, convert, load_eml, setup_status
+from email_to_pdf import build_html, convert, load_eml, parse_date, range_dates, setup_status
 
 
 def png(w, h, rgb):
@@ -66,4 +67,20 @@ with tempfile.TemporaryDirectory() as tmp:
     assert len(PdfReader(pdf).pages) == base_pages + 3, 'attachment pages missing'
     assert not list(out.glob('*.tmp.pdf')), 'temp files left behind'
     assert len(setup_status()) == 3, 'setup checklist broken'
+
+# dates typed into "Export from Outlook"
+d = datetime.date
+assert parse_date('2026-10-14') == d(2026, 10, 14) and parse_date('') is None
+assert parse_date('14/10/2026') == d(2026, 10, 14) and parse_date('10/14/2026') == d(2026, 10, 14), 'unambiguous day/month'
+assert parse_date('03/04/2026', day_first=True) == d(2026, 4, 3) and parse_date('03/04/2026', day_first=False) == d(2026, 3, 4)
+assert parse_date('14 Oct 2026') == d(2026, 10, 14) and parse_date('5/1/26', day_first=True) == d(2026, 1, 5)
+for bad in ('31/31/2026', 'yesterday', '2026-13-01'):
+    try:
+        parse_date(bad)
+        raise AssertionError(f'{bad!r} should be rejected')
+    except ValueError:
+        pass
+assert range_dates('Last 7 days', d(2026, 10, 14)) == (d(2026, 10, 8), d(2026, 10, 14))
+assert range_dates('This year', d(2026, 10, 14)) == (d(2026, 1, 1), d(2026, 10, 14))
+assert range_dates('All emails') == (None, None)
 print('ok')

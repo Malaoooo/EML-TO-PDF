@@ -8,12 +8,12 @@ Turns Outlook emails (`.msg` and `.eml`) into PDFs that look like they do in Out
 
 ## Using it
 
-- Drag emails or folders into the window, including straight out of classic Outlook, or click **Choose emails** / **Choose folder**, or drop them onto the app icon.
-- **From Outlook folder** (needs classic Outlook signed in): pick any Outlook folder, optionally with subfolders and a date range. PDFs go to `Documents\Email PDFs\<folder>` (or your Save-to folder) with subfolders matching Outlook. Emails that already have a PDF are skipped, so re-running only converts new mail.
-- In **Settings** (gear, top right): **Save PDFs to**: next to each email (default) or a folder you pick. Emails dragged from Outlook go to `Documents\Email PDFs` unless you pick a folder.
+- Drag emails or folders into the window, including straight out of classic Outlook, or click the drop zone, **Choose emails** / **Choose a folder** (Ctrl+O also works), or drop them onto the app icon.
+- **Export from Outlook** (needs classic Outlook signed in): pick any Outlook folder, optionally with its subfolders and a date range (All, Last 7/30 days, Last 12 months, This year, or custom dates in your usual format). PDFs go to `Documents\Email PDFs\<folder>` (or your Save-to folder) with subfolders matching Outlook. Emails that already have a PDF are skipped, so re-running only converts new mail.
+- In **Settings** (top right): **Save PDFs to**: next to each email (default) or a folder you pick. Emails dragged from Outlook go to `Documents\Email PDFs` unless you pick a folder.
 - **File names**: same as the email file, *Date - Subject*, or *Subject*.
 - **Attachments**: image and PDF attachments are added as pages after the email (can be turned off). Other attachments are listed by name.
-- Converting runs in the background and can be cancelled. Double-click a row in the results to open its PDF; right-click for Show in folder, Open original email and Copy PDF path.
+- Converting runs in the background and can be cancelled. Each row shows the email's subject, sender and date, with an icon for the result. Enter or double-click opens a PDF; right-click (or Shift+F10) for Show in folder, Open original email and Copy PDF path. When a batch finishes you get where the PDFs went, **Open folder**, and **Retry failed** if anything failed.
 - Theme: Light, Dark, or match Windows (in Settings).
 
 Settings are remembered in `%APPDATA%\Email to PDF`.
