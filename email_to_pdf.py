@@ -7,19 +7,26 @@ Close match (everything else): the email's own HTML plus an Outlook-style header
 printed to PDF by Microsoft Edge in headless mode, the same Chromium engine that new
 Outlook and Outlook on the web render mail with. No Outlook install needed.
 
-Run it and pick emails, or drop .msg/.eml files or folders onto the app.
+Image and PDF attachments can be added as extra pages after the email.
+Run it and pick emails, drag emails or folders into the window (also straight from
+classic Outlook), or drop them onto the app icon.
 """
 import base64
 import datetime
 import email
 import email.policy
 import html
+import io
+import json
 import mimetypes
 import os
+import queue
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox
@@ -28,14 +35,34 @@ import winreg
 
 import extract_msg
 from bs4 import UnicodeDammit
+from pypdf import PdfWriter
 
+VERSION = '1.1.0'
 EXTS = {'.msg', '.eml'}
+APP_DIR = Path(os.environ.get('APPDATA', '.'), 'Email to PDF')
+DEFAULT_OUT = Path.home() / 'Documents' / 'Email PDFs'   # for emails dragged out of Outlook (they have no folder)
+NAMINGS = {'file': 'Same name as the email file', 'date-subject': 'Date - Subject', 'subject': 'Subject'}
+DEFAULTS = {'out_dir': '', 'naming': 'file', 'attachments': True}
+PAGE_IMAGES = {'image/png', 'image/jpeg', 'image/gif', 'image/bmp', 'image/webp', 'image/svg+xml'}
+CID_RE = r'cid:([^"\'\s)>]+)'
 
 # Print backgrounds/colors exactly, 0.5" margins like Outlook's printing. Scripts never run, as in Outlook.
 PAGE_HEAD = ('<meta http-equiv="Content-Security-Policy" content="script-src \'none\'">'
              '<style>@page{margin:0.5in}'
              '*{-webkit-print-color-adjust:exact!important;print-color-adjust:exact!important}</style>')
 TD = 'font:11pt Calibri,Arial,sans-serif;color:#000;background:#fff;border:0;padding:1pt 8pt 1pt 0;vertical-align:top;text-align:left'
+
+
+def load_settings():
+    try:
+        return {**DEFAULTS, **json.loads((APP_DIR / 'settings.json').read_text(encoding='utf-8'))}
+    except (OSError, ValueError):
+        return dict(DEFAULTS)
+
+
+def save_settings(s):
+    APP_DIR.mkdir(parents=True, exist_ok=True)
+    (APP_DIR / 'settings.json').write_text(json.dumps(s, indent=2), encoding='utf-8')
 
 
 def norm_cid(cid):
@@ -49,17 +76,15 @@ def load_eml(path):
     text = body.get_content() if body else ''
     if body and body.get_content_type() == 'text/plain':
         text = plain_to_html(text)
-    inline, files = {}, []
+    files = []
     for part in msg.walk():
         name, cid = part.get_filename(), norm_cid(part['Content-ID'])
         if part.is_multipart() or part is body or not (name or cid):
             continue
-        if cid:
-            inline[cid] = (part.get_content_type(), part.get_payload(decode=True) or b'')
-        files.append((name or cid, cid))
+        files.append(dict(name=name or cid, cid=cid, mime=part.get_content_type(), data=part.get_payload(decode=True) or b''))
     date = msg['Date']
     return dict(sender=msg['From'], sent=getattr(date, 'datetime', None) or date, to=msg['To'], cc=msg['Cc'],
-                subject=msg['Subject'], html=text, inline=inline, files=files)
+                subject=msg['Subject'], html=text, files=files)
 
 
 def load_msg(path):
@@ -67,17 +92,19 @@ def load_msg(path):
     try:
         # htmlBody falls back to HTML wrapped in the RTF body, then to the plain-text body
         text = UnicodeDammit(m.htmlBody or b'', is_html=True).unicode_markup or ''
-        inline, files = {}, []
+        files = []
         for a in m.attachments:
             name = getattr(a, 'longFilename', None) or getattr(a, 'shortFilename', None) or getattr(a, 'displayName', None) or 'attachment'
-            cid, data = norm_cid(getattr(a, 'cid', None)), getattr(a, 'data', None)
-            if cid and isinstance(data, bytes):
-                inline[cid] = (getattr(a, 'mimetype', None) or mimetypes.guess_type(name)[0] or 'image/png', data)
-            files.append((name, cid))
-        return dict(sender=m.sender, sent=m.date, to=m.to, cc=m.cc, subject=m.subject,
-                    html=text, inline=inline, files=files)
+            data = getattr(a, 'data', None)   # an attached email is a Message object, not bytes
+            files.append(dict(name=name, cid=norm_cid(getattr(a, 'cid', None)), data=data if isinstance(data, bytes) else None,
+                              mime=getattr(a, 'mimetype', None) or mimetypes.guess_type(name)[0]))
+        return dict(sender=m.sender, sent=m.date, to=m.to, cc=m.cc, subject=m.subject, html=text, files=files)
     finally:
         m.close()
+
+
+def load(path):
+    return load_msg(path) if Path(path).suffix.lower() == '.msg' else load_eml(path)
 
 
 def plain_to_html(text):
@@ -97,20 +124,24 @@ def insert_after(pattern, page, add):
     return page[:m.end()] + add + page[m.end():] if m else None
 
 
+def real_attachments(mail):
+    """Attachments that aren't pictures shown inside the email body."""
+    shown = {norm_cid(c) for c in re.findall(CID_RE, mail['html'] or '', re.I)}
+    return [f for f in mail['files'] if not (f['cid'] and f['cid'] in shown)]
+
+
 def build_html(mail):
-    used = set()
+    inline = {f['cid']: f for f in mail['files'] if f['cid'] and f['data']}
 
     def embed(m):
-        cid = norm_cid(m.group(1))
-        if cid not in mail['inline']:
+        f = inline.get(norm_cid(m.group(1)))
+        if not f:
             return m.group(0)
-        used.add(cid)
-        mime, data = mail['inline'][cid]
-        return f'data:{mime};base64,{base64.b64encode(data).decode()}'
+        return f'data:{f["mime"] or "image/png"};base64,{base64.b64encode(f["data"]).decode()}'
 
-    page = re.sub(r'cid:([^"\'\s)>]+)', embed, mail['html'] or '', flags=re.I)
+    page = re.sub(CID_RE, embed, mail['html'] or '', flags=re.I)
     rows = [('From', mail['sender']), ('Sent', fmt_date(mail['sent'])), ('To', mail['to']), ('Cc', mail['cc']),
-            ('Subject', mail['subject']), ('Attachments', '; '.join(n for n, cid in mail['files'] if cid not in used))]
+            ('Subject', mail['subject']), ('Attachments', '; '.join(f['name'] for f in real_attachments(mail)))]
     header = ''.join(f'<tr><td style="{TD};font-weight:bold;white-space:nowrap">{k}:</td>'
                      f'<td style="{TD}">{html.escape(str(v))}</td></tr>' for k, v in rows if v)
     header = (f'<table style="border-collapse:collapse;margin:0 0 6pt;width:auto">{header}</table>'
@@ -139,9 +170,51 @@ def to_pdf(page, pdf):
         src.write_text(page, encoding='utf-8-sig')   # BOM beats whatever charset the email's HTML declares
         subprocess.run([str(find_browser()), '--headless', '--disable-gpu', '--no-first-run', '--no-pdf-header-footer',
                         f'--user-data-dir={Path(tmp, "profile")}', f'--print-to-pdf={pdf}', src.as_uri()],
-                       stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120)
+                       stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120,
+                       creationflags=subprocess.CREATE_NO_WINDOW)
     if not pdf.exists():
         raise RuntimeError('Edge did not produce a PDF')
+
+
+def append_attachments(pdf, mail):
+    """Adds image and PDF attachments as pages after the email. Returns (added, skipped)."""
+    images, pdfs = [], []
+    for f in real_attachments(mail):
+        mime = (f['mime'] or mimetypes.guess_type(f['name'])[0] or '').lower()
+        if not f['data']:
+            continue
+        if mime in PAGE_IMAGES:
+            images.append((f, mime))
+        elif mime == 'application/pdf' or f['name'].lower().endswith('.pdf'):
+            pdfs.append(f)
+    if not images and not pdfs:
+        return 0, 0
+    writer = PdfWriter(clone_from=str(pdf))
+    added = skipped = 0
+    if images:   # one page per picture, captioned with its file name
+        page = ''.join(f'<section><p>{html.escape(f["name"])}</p>'
+                       f'<img src="data:{mime};base64,{base64.b64encode(f["data"]).decode()}"></section>' for f, mime in images)
+        shots = pdf.with_name(pdf.stem + '.attachments.tmp.pdf')
+        to_pdf('<!DOCTYPE html><style>@page{margin:0.5in}body{margin:0;font:10pt Calibri,Arial,sans-serif;color:#555}'
+               'section{break-after:page}section:last-child{break-after:auto}p{margin:0 0 6pt}'
+               'img{display:block;max-width:100%;max-height:9.2in;object-fit:contain}</style>' + page, shots)
+        try:
+            writer.append(str(shots))
+            added += len(images)
+        finally:
+            shots.unlink(missing_ok=True)
+    for f in pdfs:
+        try:
+            writer.append(io.BytesIO(f['data']))
+            added += 1
+        except Exception:   # password-protected or broken PDF
+            skipped += 1
+    tmp = pdf.with_name(pdf.stem + '.tmp.pdf')
+    with open(tmp, 'wb') as out:
+        writer.write(out)
+    writer.close()
+    os.replace(tmp, pdf)
+    return added, skipped
 
 
 def _reg_has(key):
@@ -164,17 +237,23 @@ def setup_status():
             ('Classic Outlook is signed in to an email account', signed_in)]
 
 
+def outlook():
+    """Returns (Outlook app, whether we started it)."""
+    import win32com.client
+    try:
+        win32com.client.GetActiveObject('Outlook.Application')
+        started = False
+    except Exception:
+        started = True
+    return win32com.client.Dispatch('Outlook.Application'), started
+
+
 class OutlookPrinter:
     """Exact copy: Outlook saves the email (its header block + body + images) as MHT, Word prints it."""
 
     def __init__(self):
         import win32com.client
-        try:
-            win32com.client.GetActiveObject('Outlook.Application')
-            self.started = False
-        except Exception:
-            self.started = True
-        self.ol = win32com.client.Dispatch('Outlook.Application')
+        self.ol, self.started = outlook()
         self.word = win32com.client.DispatchEx('Word.Application')   # own hidden Word, not the user's
         self.word.Visible = False
         self.word.DisplayAlerts = 0
@@ -205,20 +284,48 @@ class OutlookPrinter:
             self.ol.Quit()
 
 
-def convert(path, printer=None):
-    """Returns (pdf path, 'exact' or 'close')."""
-    path = Path(path)
-    pdf = path.with_suffix('.pdf')
+def safe_name(text, limit=120):
+    text = re.sub(r'[\\/:*?"<>|\x00-\x1f]', '_', str(text or ''))[:limit].strip(' .')
+    return text or '(no subject)'
+
+
+def pdf_target(src, mail, settings, taken, fallback_dir=None):
+    """Where the PDF goes, following the Save-to and naming settings. `taken` avoids clashes within one batch."""
+    folder = Path(settings['out_dir'] or fallback_dir or src.parent)
+    naming, sent = settings['naming'], mail['sent']
+    if naming == 'file':
+        stem = src.stem
+    else:
+        stem = safe_name(mail['subject'])
+        if naming == 'date-subject':
+            if not isinstance(sent, datetime.datetime):
+                sent = datetime.datetime.fromtimestamp(src.stat().st_mtime)
+            stem = f'{sent.astimezone() if sent.tzinfo else sent:%Y-%m-%d %H%M} - {stem}'
+    pdf, n = folder / f'{stem}.pdf', 2
+    while str(pdf).lower() in taken:
+        pdf, n = folder / f'{stem} ({n}).pdf', n + 1
+    taken.add(str(pdf).lower())
+    return pdf
+
+
+def convert(path, settings=None, printer=None, taken=None, fallback_dir=None):
+    """Returns (pdf path, 'exact' or 'close', attachments added, attachments skipped)."""
+    path, settings = Path(path), settings or DEFAULTS
+    mail = load(path)
+    pdf = pdf_target(path, mail, settings, set() if taken is None else taken, fallback_dir)
+    pdf.parent.mkdir(parents=True, exist_ok=True)
+    mode = 'close'
     if printer and path.suffix.lower() == '.msg':   # Outlook can't open .eml files this way
         pdf.unlink(missing_ok=True)
         try:
             printer.convert(path, pdf)
-            return pdf, 'exact'
+            mode = 'exact'
         except Exception:
             pass   # e.g. a protected or odd .msg: still produce a close match
-    mail = load_msg(path) if path.suffix.lower() == '.msg' else load_eml(path)
-    to_pdf(build_html(mail), pdf)
-    return pdf, 'close'
+    if mode == 'close':
+        to_pdf(build_html(mail), pdf)
+    added, skipped = append_attachments(pdf, mail) if settings['attachments'] else (0, 0)
+    return pdf, mode, added, skipped
 
 
 def expand(paths):
@@ -227,6 +334,82 @@ def expand(paths):
             yield from sorted(f for f in p.rglob('*') if f.suffix.lower() in EXTS)
         elif p.suffix.lower() in EXTS:
             yield p
+
+
+def export_outlook_selection(folder):
+    """Saves the emails selected in classic Outlook (what was just dragged) as .msg files into folder."""
+    ol, _ = outlook()
+    exp = ol.ActiveExplorer()
+    if not exp:
+        return []
+    sel, out = exp.Selection, []
+    for i in range(1, sel.Count + 1):
+        item = sel.Item(i)
+        p, n = Path(folder, safe_name(getattr(item, 'Subject', ''), 100) + '.msg'), 2
+        while p.exists():
+            p, n = Path(folder, f'{safe_name(item.Subject, 100)} ({n}).msg'), n + 1
+        item.SaveAs(str(p), 9)   # olMSGUnicode
+        out.append(p)
+    return out
+
+
+def run_batch(job, settings, ready, events, cancel):
+    """Worker thread: converts the job and reports progress to the window through `events`."""
+    import pythoncom
+    pythoncom.CoInitialize()
+    temp = printer = None
+    ok = 0
+    files = []
+    try:
+        fallback, empty = None, 'No .msg or .eml files found there.'
+        if job == 'outlook':
+            events.put(('status', 'Getting the emails from Outlook...'))
+            temp = tempfile.mkdtemp(prefix='email-to-pdf-')
+            empty = 'Nothing to convert: select emails in classic Outlook, then drag them here.'
+            try:
+                files = export_outlook_selection(temp)
+            except Exception as e:
+                empty = f'Could not get the emails from Outlook: {e}'
+            fallback = DEFAULT_OUT
+        else:
+            files = list(expand(job))
+        if not files:
+            events.put(('status', empty))
+            return
+        events.put(('start', len(files)))
+        if ready and any(f.suffix.lower() == '.msg' for f in files):
+            events.put(('status', 'Starting Outlook and Word...'))
+            try:
+                printer = OutlookPrinter()
+            except Exception:
+                pass   # every file then falls back to close match, which the Result column shows
+        taken = set()
+        for i, f in enumerate(files, 1):
+            if cancel.is_set():
+                break
+            events.put(('status', f'Converting {i} of {len(files)}: {f.name}'))
+            try:
+                pdf, mode, added, skipped = convert(f, settings, printer, taken, fallback)
+                note = 'Exact copy' if mode == 'exact' else 'Close match'
+                if added:
+                    note += f' + {added} attachment{"s" * (added > 1)}'
+                if skipped:
+                    note += f' ({skipped} skipped)'
+                events.put(('row', f.name, '✔  ' + note, mode, str(pdf)))
+                ok += 1
+            except Exception as e:
+                events.put(('row', f.name, '✖  Failed (double-click for why)', 'failed', f'{f}\n\n{e}'))
+            events.put(('progress', i))
+    finally:
+        if printer:
+            printer.close()
+        if temp:
+            shutil.rmtree(temp, ignore_errors=True)
+        if files:
+            word = 'Cancelled' if cancel.is_set() else 'Done'
+            events.put(('status', f'{word}: {ok} of {len(files)} converted. Double-click a row to open its PDF.'))
+        events.put(('done',))
+        pythoncom.CoUninitialize()
 
 
 def dark_mode():
@@ -255,12 +438,18 @@ def main():
         pass
     import sv_ttk
     from tkinter import ttk
+    from tkinterdnd2 import COPY, DND_ALL, TkinterDnD
 
     dark = dark_mode()
-    root = tk.Tk()
+    settings = load_settings()
+    root = TkinterDnD.Tk()
     root.title('Email to PDF')
-    root.geometry('820x600')
-    root.minsize(640, 460)
+    root.geometry('860x680')
+    root.minsize(680, 540)
+    try:
+        root.iconbitmap(default=str(Path(getattr(sys, '_MEIPASS', Path(__file__).parent), 'icon.ico')))
+    except tk.TclError:
+        pass
     sv_ttk.set_theme('dark' if dark else 'light')
     style_titlebar(root, dark)
     green, amber, red, muted = (('#6ccb5f', '#fce100', '#ff99a4', '#9a9a9a') if dark
@@ -275,9 +464,12 @@ def main():
     page = ttk.Frame(root, padding=(28, 24))
     page.pack(fill='both', expand=True)
 
-    ttk.Label(page, text='Email to PDF', style='Title.TLabel').pack(anchor='w')
+    head = ttk.Frame(page)
+    head.pack(fill='x')
+    ttk.Label(head, text='Email to PDF', style='Title.TLabel').pack(side='left')
+    ttk.Label(head, text=f'v{VERSION}', style='Muted.TLabel').pack(side='left', padx=10, pady=(12, 0))
     ttk.Label(page, style='Muted.TLabel', text='Turn Outlook emails (.msg or .eml) into PDFs. '
-              'Each PDF is saved next to its email.').pack(anchor='w', pady=(2, 18))
+              'Drag emails or folders into this window, straight from Outlook too.').pack(anchor='w', pady=(2, 16))
 
     # mode card
     card = ttk.Frame(page, style='Card.TFrame', padding=(18, 14))
@@ -293,20 +485,65 @@ def main():
     setup_btn = ttk.Button(card, text='Set up')
     setup_btn.pack(side='right')
 
+    # options card: where to save, how to name, attachments
+    opts = ttk.Frame(page, style='Card.TFrame', padding=(18, 12))
+    opts.pack(fill='x', pady=(12, 0))
+    opts.columnconfigure(1, weight=1)
+    ttk.Label(opts, text='Save PDFs to').grid(row=0, column=0, sticky='w', padx=(0, 14), pady=4)
+    out_label = ttk.Label(opts, style='Muted.TLabel')
+    out_label.grid(row=0, column=1, sticky='w')
+    out_btns = ttk.Frame(opts, style='Card.TFrame')
+    out_btns.grid(row=0, column=2, sticky='e')
+    change_out = ttk.Button(out_btns, text='Change...')
+    change_out.pack(side='left')
+    reset_out = ttk.Button(out_btns, text='Next to each email')
+    reset_out.pack(side='left', padx=(6, 0))
+    ttk.Label(opts, text='File names').grid(row=1, column=0, sticky='w', padx=(0, 14), pady=4)
+    naming = ttk.Combobox(opts, state='readonly', width=30, values=list(NAMINGS.values()))
+    naming.set(NAMINGS.get(settings['naming'], NAMINGS['file']))
+    naming.grid(row=1, column=1, sticky='w')
+    attach_var = tk.BooleanVar(value=settings['attachments'])
+    attach = ttk.Checkbutton(opts, text='Add image and PDF attachments as pages after the email', variable=attach_var)
+    attach.grid(row=2, column=0, columnspan=3, sticky='w', pady=(6, 0))
+
+    def show_out():
+        out_label.configure(text=settings['out_dir'] or 'Next to each email (dragged from Outlook: Documents\\Email PDFs)')
+        reset_out.configure(state='normal' if settings['out_dir'] else 'disabled')
+
+    def set_out(value):
+        settings['out_dir'] = value
+        save_settings(settings)
+        show_out()
+
+    def on_naming(_):
+        settings['naming'] = next(k for k, v in NAMINGS.items() if v == naming.get())
+        save_settings(settings)
+
+    def on_attach():
+        settings['attachments'] = attach_var.get()
+        save_settings(settings)
+
+    change_out.configure(command=lambda: (d := filedialog.askdirectory(parent=root)) and set_out(str(Path(d))))
+    reset_out.configure(command=lambda: set_out(''))
+    naming.bind('<<ComboboxSelected>>', on_naming)
+    attach.configure(command=on_attach)
+    show_out()
+
     # actions
     actions = ttk.Frame(page)
-    actions.pack(fill='x', pady=(18, 12))
+    actions.pack(fill='x', pady=(16, 12))
     pick = ttk.Button(actions, text='Choose emails', style='Accent.TButton')
     pick.pack(side='left', ipadx=10)
     folder = ttk.Button(actions, text='Choose folder')
     folder.pack(side='left', padx=8)
+    cancel_btn = ttk.Button(actions, text='Cancel')
     open_dir = ttk.Button(actions, text='Open PDF folder', state='disabled')
     open_dir.pack(side='right')
 
     # progress + results
     progress = ttk.Progressbar(page, mode='determinate')
     progress.pack(fill='x')
-    summary = ttk.Label(page, style='Muted.TLabel', text='Tip: you can also drop emails or folders onto the app icon.')
+    summary = ttk.Label(page, style='Muted.TLabel', text='Drop emails or folders anywhere in this window to convert them.')
     summary.pack(anchor='w', pady=(6, 10))
     table = ttk.Frame(page)
     table.pack(fill='both', expand=True)
@@ -314,7 +551,7 @@ def main():
     tree.heading('file', text='Email', anchor='w')
     tree.heading('result', text='Result', anchor='w')
     tree.column('file', anchor='w', stretch=True)
-    tree.column('result', anchor='w', width=230, stretch=False)
+    tree.column('result', anchor='w', width=300, stretch=False)
     tree.tag_configure('exact', foreground=green)
     tree.tag_configure('close', foreground=amber)
     tree.tag_configure('failed', foreground=red)
@@ -323,6 +560,8 @@ def main():
     tree.pack(side='left', fill='both', expand=True)
     scroll.pack(side='right', fill='y')
     pdfs, errors, last_dir = {}, {}, []
+    state = {'busy': False, 'closing': False}
+    events, cancel = queue.Queue(), threading.Event()
 
     def on_open(_):   # double-click: open the PDF, or show why it failed
         row = tree.focus()
@@ -342,50 +581,84 @@ def main():
         setup_btn.configure(text='Check setup' if ready else 'Set up')
         return ready
 
-    def run(paths):
-        files = list(expand(paths))
-        if not files:
-            if paths:
-                summary.configure(text='No .msg or .eml files found there.')
-            return
-        for b in (pick, folder, setup_btn):
-            b.configure(state='disabled')
-        root.configure(cursor='watch')
-        progress.configure(maximum=len(files), value=0)
-        printer = None
-        if refresh() and any(f.suffix.lower() == '.msg' for f in files):
-            summary.configure(text='Starting Outlook and Word...')
-            root.update()
-            try:
-                printer = OutlookPrinter()
-            except Exception:
-                pass   # every file then falls back to close match, which the Result column shows
-        ok = 0
-        try:
-            for i, f in enumerate(files, 1):
-                summary.configure(text=f'Converting {i} of {len(files)}: {f.name}')
-                root.update()
-                try:
-                    pdf, mode = convert(f, printer)
-                    row = tree.insert('', 0, values=(f.name, '✔  Exact copy' if mode == 'exact' else '✔  Close match'), tags=(mode,))
-                    pdfs[row] = pdf
-                    last_dir[:] = [pdf.parent]
-                    ok += 1
-                except Exception as e:
-                    row = tree.insert('', 0, values=(f.name, '✖  Failed (double-click for why)'), tags=('failed',))
-                    errors[row] = f'{f}\n\n{e}'
-                progress.configure(value=i)
-        finally:
-            if printer:
-                printer.close()
-            for b in (pick, folder, setup_btn):
-                b.configure(state='normal')
-            root.configure(cursor='')
-        summary.configure(text=f'Done: {ok} of {len(files)} converted. Double-click a row to open its PDF.')
-        if last_dir:
-            open_dir.configure(state='normal')
+    def set_busy(busy):
+        state['busy'] = busy
+        for w in (pick, folder, setup_btn, change_out, attach):
+            w.configure(state='disabled' if busy else 'normal')
+        naming.configure(state='disabled' if busy else 'readonly')
+        if not busy:
+            show_out()
+        if busy:
+            cancel_btn.configure(state='normal', text='Cancel')
+            cancel_btn.pack(side='left')
+        else:
+            cancel_btn.pack_forget()
+        root.configure(cursor='watch' if busy else '')
 
-    skip_file = Path(os.environ.get('APPDATA', '.'), 'Email to PDF', 'setup-done')
+    def start(job):
+        if state['busy'] or not job:
+            return
+        cancel.clear()
+        set_busy(True)
+        progress.configure(value=0)
+        threading.Thread(target=run_batch, args=(job, dict(settings), refresh(), events, cancel), daemon=True).start()
+
+    def poll():
+        try:
+            while True:
+                kind, *data = events.get_nowait()
+                if kind == 'status':
+                    summary.configure(text=data[0])
+                elif kind == 'start':
+                    progress.configure(maximum=data[0], value=0)
+                elif kind == 'progress':
+                    progress.configure(value=data[0])
+                elif kind == 'row':
+                    name, result, tag, target = data
+                    row = tree.insert('', 0, values=(name, result), tags=(tag,))
+                    if tag == 'failed':
+                        errors[row] = target
+                    else:
+                        pdfs[row] = target
+                        last_dir[:] = [Path(target).parent]
+                        open_dir.configure(state='normal')
+                elif kind == 'done':
+                    set_busy(False)
+                    if state['closing']:
+                        root.destroy()
+                        return
+        except queue.Empty:
+            pass
+        root.after(100, poll)
+
+    def on_cancel():
+        cancel.set()
+        cancel_btn.configure(state='disabled', text='Cancelling...')
+
+    def on_close():
+        if state['busy']:   # finish the current email and close Outlook/Word cleanly first
+            state['closing'] = True
+            on_cancel()
+        else:
+            root.destroy()
+
+    # drag and drop: files/folders from Explorer, or emails straight out of classic Outlook
+    def on_drop_enter(event):
+        summary.configure(text='Drop to convert')
+        return COPY
+
+    def on_drop(event):
+        paths = [p for p in root.tk.splitlist(event.data) if os.path.exists(p)] if event.data else []
+        # Outlook drags carry no files; the dragged emails are Outlook's current selection
+        root.after(50, start, paths or 'outlook')
+        return COPY   # never MOVE, so Outlook keeps its emails
+
+    root.drop_target_register(DND_ALL)
+    root.dnd_bind('<<DropEnter>>', on_drop_enter)
+    root.dnd_bind('<<DropLeave>>', lambda e: summary.configure(text='Drop emails or folders anywhere in this window to convert them.'))
+    root.dnd_bind('<<Drop>>', on_drop)
+
+    skip_file = APP_DIR / 'setup-done'
 
     def setup():
         win = tk.Toplevel(root)
@@ -439,15 +712,18 @@ def main():
         win.grab_set()
 
     setup_btn.configure(command=setup)
-    pick.configure(command=lambda: run(filedialog.askopenfilenames(
-        parent=root, filetypes=[('Outlook emails', '*.msg *.eml'), ('All files', '*.*')])))
-    folder.configure(command=lambda: run([d] if (d := filedialog.askdirectory(parent=root)) else []))
+    pick.configure(command=lambda: start(list(filedialog.askopenfilenames(
+        parent=root, filetypes=[('Outlook emails', '*.msg *.eml'), ('All files', '*.*')]))))
+    folder.configure(command=lambda: start([d] if (d := filedialog.askdirectory(parent=root)) else []))
     open_dir.configure(command=lambda: last_dir and os.startfile(last_dir[0]))
+    cancel_btn.configure(command=on_cancel)
+    root.protocol('WM_DELETE_WINDOW', on_close)
 
     if not refresh() and not skip_file.exists():
         root.after(300, setup)   # first launch on a PC that isn't set up yet
     if len(sys.argv) > 1:
-        root.after(200, run, sys.argv[1:])
+        root.after(200, start, sys.argv[1:])
+    root.after(100, poll)
     root.mainloop()
 
 

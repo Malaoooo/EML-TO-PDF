@@ -16,13 +16,18 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      - run: choco install innosetup --no-progress -y
       - run: build.bat
         shell: cmd
       - uses: actions/upload-artifact@v4
         with:
           name: Email-to-PDF
-          path: dist/Email to PDF.exe
+          path: |
+            dist/Email to PDF.exe
+            dist/Email-to-PDF-Setup.exe
       - if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/Email to PDF.exe
+          files: |
+            dist/Email-to-PDF-Setup.exe
+            dist/Email to PDF.exe
