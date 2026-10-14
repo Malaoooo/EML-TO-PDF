@@ -13,6 +13,6 @@ echo Built: %~dp0dist\Email to PDF.exe
 set "ISCC=%LOCALAPPDATA%\Programs\Inno Setup 6\ISCC.exe"
 if not exist "%ISCC%" set "ISCC=%ProgramFiles(x86)%\Inno Setup 6\ISCC.exe"
 if not exist "%ISCC%" (echo Inno Setup not found, skipping the installer. & exit /b 0)
-for /f %%v in ('.venv\Scripts\python -c "import re;print(re.search(r\"VERSION = '(.+?)'\", open('email_to_pdf.py', encoding='utf-8').read())[1])"') do set VERSION=%%v
+for /f "tokens=2 delims='" %%v in ('findstr /b /c:"VERSION = " email_to_pdf.py') do set "VERSION=%%v"
 "%ISCC%" /Q /DAppVersion=%VERSION% installer.iss || exit /b 1
 echo Built: %~dp0dist\Email-to-PDF-Setup.exe
